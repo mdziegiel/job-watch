@@ -17,7 +17,7 @@ Self-hosted job monitoring and alerting for Michael Dziegiel's senior infrastruc
 - LinkedIn public listings scraper
 - Dice public listings scraper
 - ZipRecruiter public listings scraper
-- Deduplication by URL and normalized title/company fingerprint
+- Deduplication by canonical URL or normalized title/company/location
 
 ## Features
 
@@ -77,6 +77,8 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_HOME_CHANNEL=
 INDEED_MCP_URL=https://mcp.indeed.com/claude/mcp
 SCHEDULER_ENABLED=1
+ALERT_BATCH_LIMIT=10
+DASHBOARD_URL=http://10.10.10.237:8085
 ```
 
 ## API highlights

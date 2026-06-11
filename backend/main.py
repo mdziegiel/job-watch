@@ -32,6 +32,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_HOME_CHANNEL") or os.getenv("TELEGRAM_CHAT_ID", "")
 INDEED_MCP_URL = os.getenv("INDEED_MCP_URL", "https://mcp.indeed.com/claude/mcp")
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "1") == "1"
+ALERT_BATCH_LIMIT = int(os.getenv("ALERT_BATCH_LIMIT", "10"))
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://10.10.10.237:8085").rstrip("/")
 
 TARGET_TITLES = [
     "Network Administrator",
@@ -114,8 +116,69 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
             CREATE INDEX IF NOT EXISTS idx_jobs_seen ON jobs(first_seen);
             CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(match_score);
+            CREATE INDEX IF NOT EXISTS idx_jobs_url ON jobs(url);
+            CREATE INDEX IF NOT EXISTS idx_jobs_exact_duplicate ON jobs(title, company, location);
             """
         )
+        # Existing rows predate the strict first-insert notification contract.
+        # Mark them notified at startup so deploy/restart cannot resurrect old jobs as alerts.
+        c.execute("UPDATE jobs SET alerted=1 WHERE alerted=0 AND first_seen IS NOT NULL")
+
+
+def dedupe_jobs() -> int:
+    """Remove duplicate jobs, keeping the newest row. Duplicate means same URL or same title/company/location."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM jobs ORDER BY COALESCE(last_seen, first_seen, '') DESC, COALESCE(first_seen, '') DESC, id DESC"
+        ).fetchall()
+        seen_urls: set[str] = set()
+        seen_identities: set[tuple[str, str, str]] = set()
+        delete_ids = []
+        for row in rows:
+            url_key = canonical_url(row["url"])
+            id_key = identity_key(row)
+            duplicate = bool(url_key and url_key in seen_urls) or id_key in seen_identities
+            if duplicate:
+                delete_ids.append(row["id"])
+                continue
+            if url_key:
+                seen_urls.add(url_key)
+            seen_identities.add(id_key)
+        if delete_ids:
+            placeholders = ",".join("?" for _ in delete_ids)
+            c.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", delete_ids)
+        removed = len(delete_ids)
+        if removed:
+            print(f"dedupe removed {removed} duplicate job rows", flush=True)
+        return removed
+
+
+def backfill_linkedin_companies() -> int:
+    """Best-effort repair for old LinkedIn rows scraped before company extraction existed."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT id, url FROM jobs WHERE source='LinkedIn' AND COALESCE(company, '')='' AND COALESCE(url, '')!=''"
+        ).fetchall()
+        fixed = 0
+        for row in rows:
+            company = linkedin_company_from_url(row["url"])
+            if company:
+                c.execute("UPDATE jobs SET company=? WHERE id=?", (company, row["id"]))
+                fixed += 1
+        malformed = c.execute(
+            "SELECT id, title, location FROM jobs WHERE source='LinkedIn' AND COALESCE(company, '')='' AND title LIKE '%' || char(10) || '%'"
+        ).fetchall()
+        for row in malformed:
+            lines = [x.strip() for x in (row["title"] or "").splitlines() if x.strip()]
+            if len(lines) >= 2:
+                title, company = lines[0], clean_company(lines[1])
+                location = row["location"] or (lines[2] if len(lines) >= 3 else "")
+                if company:
+                    c.execute("UPDATE jobs SET title=?, company=?, location=COALESCE(NULLIF(?, ''), location) WHERE id=?", (title, company, location, row["id"]))
+                    fixed += 1
+        if fixed:
+            print(f"backfilled {fixed} LinkedIn company names", flush=True)
+        return fixed
 
 
 def rowdict(row):
@@ -128,15 +191,61 @@ def rowdict(row):
     return d
 
 
-def norm(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip().lower())
+def norm(text) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def canonical_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw.split("?")[0].split("#")[0].rstrip("/").lower()
+        path = re.sub(r"/+", "/", urllib.parse.unquote(parsed.path or "")).rstrip("/")
+        return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+    except Exception:
+        return raw.split("?")[0].split("#")[0].rstrip("/").lower()
+
+
+def field(job, name: str, default=""):
+    if hasattr(job, "get"):
+        return job.get(name, default)
+    try:
+        return job[name]
+    except Exception:
+        return default
+
+
+def identity_key(job: dict) -> tuple[str, str, str]:
+    return (norm(field(job, "title")), norm(field(job, "company")), norm(field(job, "location")))
 
 
 def fingerprint(job: dict) -> str:
-    url = (job.get("url") or "").strip().split("?")[0].rstrip("/")
+    url = canonical_url(job.get("url", ""))
     if url:
         return hashlib.sha256(("url:" + url).encode()).hexdigest()
-    return hashlib.sha256(("tc:" + norm(job.get("title")) + "|" + norm(job.get("company"))).encode()).hexdigest()
+    title, company, location = identity_key(job)
+    return hashlib.sha256(("tcl:" + title + "|" + company + "|" + location).encode()).hexdigest()
+
+
+def find_existing_job(c: sqlite3.Connection, job: dict, fp: str):
+    old = c.execute("SELECT * FROM jobs WHERE fingerprint=?", (fp,)).fetchone()
+    if old:
+        return old
+
+    url = canonical_url(job.get("url", ""))
+    if url:
+        for row in c.execute("SELECT * FROM jobs WHERE COALESCE(url, '') != ''"):
+            if canonical_url(row["url"]) == url:
+                return row
+
+    key = identity_key(job)
+    for row in c.execute("SELECT * FROM jobs"):
+        if identity_key(row) == key:
+            return row
+    return None
 
 
 def salary_floor(text: str) -> int:
@@ -269,15 +378,15 @@ def upsert_job(job: dict):
     fp = fingerprint(job)
     score, summary, breakdown, ideal = score_job(job)
     with connect() as c:
-        old = c.execute("SELECT * FROM jobs WHERE fingerprint=?", (fp,)).fetchone()
+        old = find_existing_job(c, job, fp)
         if old:
             c.execute(
-                "UPDATE jobs SET last_seen=?, salary=COALESCE(NULLIF(?, ''), salary), description=COALESCE(NULLIF(?, ''), description), match_score=?, fit_summary=?, score_breakdown=?, ideal_match=? WHERE id=?",
-                (utcnow(), job.get("salary", ""), job.get("description", ""), score, summary, json.dumps(breakdown), int(ideal), old["id"]),
+                "UPDATE jobs SET last_seen=?, company=COALESCE(NULLIF(company, ''), NULLIF(?, ''), company), location=COALESCE(NULLIF(location, ''), NULLIF(?, ''), location), salary=COALESCE(NULLIF(?, ''), salary), url=COALESCE(NULLIF(?, ''), url), description=COALESCE(NULLIF(?, ''), description), match_score=?, fit_summary=?, score_breakdown=?, ideal_match=?, fingerprint=COALESCE(NULLIF(fingerprint, ''), ?) WHERE id=?",
+                (utcnow(), job.get("company", ""), job.get("location", ""), job.get("salary", ""), job.get("url", ""), job.get("description", ""), score, summary, json.dumps(breakdown), int(ideal), fp, old["id"]),
             )
             return rowdict(c.execute("SELECT * FROM jobs WHERE id=?", (old["id"],)).fetchone()), False
         c.execute(
-            "INSERT INTO jobs(source,title,company,location,salary,url,description,remote_type,match_score,fit_summary,score_breakdown,ideal_match,fingerprint,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs(source,title,company,location,salary,url,description,remote_type,match_score,fit_summary,score_breakdown,ideal_match,fingerprint,first_seen,last_seen,alerted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
             (job.get("source"), job.get("title"), job.get("company"), job.get("location"), job.get("salary"), job.get("url"), job.get("description"), job.get("remote_type"), score, summary, json.dumps(breakdown), int(ideal), fp, utcnow(), utcnow()),
         )
         rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -285,7 +394,96 @@ def upsert_job(job: dict):
 
 
 def clean_text(text: str) -> str:
-    return html.unescape(re.sub(r"<[^>]+>", " ", text or "")).strip()
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", text or ""))).strip()
+
+
+def clean_company(text: str) -> str:
+    company = clean_text(text)
+    company = re.sub(r"\s*(?:logo|company logo)$", "", company, flags=re.I).strip(" -·|\t\n\r")
+    noise = {"", "promoted", "be an early applicant", "actively hiring", "view job"}
+    return "" if company.lower() in noise else company[:160]
+
+
+def linkedin_company_from_url(url: str) -> str:
+    """Extract company from LinkedIn public slugs like title-at-acme-corp-123456."""
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url or "").path).rstrip("/")
+    slug = path.rsplit("/", 1)[-1]
+    m = re.search(r"-at-(?P<company>.+?)(?:-\d+)?$", slug, re.I)
+    if not m:
+        return ""
+    company = re.sub(r"[^\w\s&.+-]+", " ", m.group("company").replace("-", " "), flags=re.UNICODE)
+    return clean_company(company.title())
+
+
+def html_attr(tag: str, attr: str):
+    m = re.search(rf'{attr}=["\']([^"\']+)["\']', tag or "", re.I)
+    return html.unescape(m.group(1)) if m else ""
+
+
+def extract_linkedin_company(card_html: str) -> str:
+    patterns = [
+        r'<h4[^>]*class=["\'][^"\']*base-search-card__subtitle[^"\']*["\'][^>]*>(?P<value>.*?)</h4>',
+        r'<a[^>]*class=["\'][^"\']*hidden-nested-link[^"\']*["\'][^>]*>(?P<value>.*?)</a>',
+        r'<a[^>]*data-tracking-control-name=["\'][^"\']*job_card_company[^"\']*["\'][^>]*>(?P<value>.*?)</a>',
+        r'<span[^>]*class=["\'][^"\']*job-card-container__primary-description[^"\']*["\'][^>]*>(?P<value>.*?)</span>',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, card_html or "", re.S | re.I)
+        if m:
+            company = clean_company(m.group("value"))
+            if company:
+                return company
+    alt = re.search(r'<img[^>]+alt=["\'](?P<value>[^"\']+)["\'][^>]*>', card_html or "", re.I)
+    if alt:
+        company = clean_company(alt.group("value"))
+        if company:
+            return company
+    return ""
+
+
+def extract_linkedin_title(card_html: str, fallback: str) -> str:
+    for pattern in [
+        r'<h3[^>]*class=["\'][^"\']*base-search-card__title[^"\']*["\'][^>]*>(?P<value>.*?)</h3>',
+        r'<a[^>]+href=["\']https://www\.linkedin\.com/jobs/view/[^"\']+["\'][^>]*>(?P<value>.*?)</a>',
+    ]:
+        m = re.search(pattern, card_html or "", re.S | re.I)
+        if m:
+            title = clean_text(m.group("value"))
+            if title:
+                return title
+    return fallback
+
+
+def extract_linkedin_location(card_html: str) -> str:
+    m = re.search(r'<span[^>]*class=["\'][^"\']*job-search-card__location[^"\']*["\'][^>]*>(?P<value>.*?)</span>', card_html or "", re.S | re.I)
+    return clean_text(m.group("value")) if m else "Lowell MA / Remote"
+
+
+def parse_linkedin_jobs(page_html: str, fallback_title: str) -> list[dict]:
+    jobs = []
+    seen = set()
+    cards = re.findall(r'<(?:li|div)[^>]*(?:base-card|job-search-card)[^>]*>.*?</(?:li|div)>', page_html or "", re.S | re.I)
+    if not cards:
+        cards = [m.group(0) for m in re.finditer(r'.{0,2500}https://www\.linkedin\.com/jobs/view/[^"#?<]+.{0,2500}', page_html or "", re.S | re.I)]
+    for card in cards:
+        url_m = re.search(r'https://www\.linkedin\.com/jobs/view/[^?"#<\s]+', card, re.I)
+        if not url_m:
+            continue
+        url = html.unescape(url_m.group(0)).rstrip('/')
+        if url in seen:
+            continue
+        seen.add(url)
+        jobs.append({
+            "source": "LinkedIn",
+            "title": extract_linkedin_title(card, fallback_title),
+            "company": extract_linkedin_company(card) or linkedin_company_from_url(url),
+            "location": extract_linkedin_location(card),
+            "salary": "",
+            "url": url,
+            "description": "LinkedIn public listing",
+            "remote_type": "unknown",
+        })
+    return jobs
 
 
 def fetch(url: str) -> str:
@@ -295,14 +493,10 @@ def fetch(url: str) -> str:
 def scrape_linkedin(title: str):
     q = urllib.parse.quote(title)
     url = f"https://www.linkedin.com/jobs/search?keywords={q}&location=Lowell%2C%20Massachusetts%2C%20United%20States&distance=50"
-    jobs = []
     try:
-        text = fetch(url)
-        for m in re.finditer(r'<a[^>]+href="(?P<url>https://www\.linkedin\.com/jobs/view/[^?"#]+)[^>]*>\s*(?P<title>.*?)\s*</a>', text, re.S):
-            jobs.append({"source": "LinkedIn", "title": clean_text(m.group("title")) or title, "company": "", "location": "Lowell MA / Remote", "salary": "", "url": m.group("url"), "description": "LinkedIn public listing", "remote_type": "unknown"})
+        return parse_linkedin_jobs(fetch(url), title)[:15]
     except Exception:
-        pass
-    return jobs[:15]
+        return []
 
 
 def scrape_dice(title: str):
@@ -389,12 +583,41 @@ def send_telegram(job: dict):
         pass
 
 
+def send_gotify_summary(count: int):
+    if not GOTIFY_TOKEN:
+        return
+    try:
+        message = f"{count} new jobs found — check the dashboard"
+        requests.post(f"{GOTIFY_URL}/message", params={"token": GOTIFY_TOKEN}, json={"title": "Job Watch", "message": f"{message}\n{DASHBOARD_URL}", "priority": 5}, timeout=10)
+    except Exception:
+        pass
+
+
+def send_telegram_summary(count: int):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        text = f"{count} new jobs found — check the dashboard"
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{text}\n{DASHBOARD_URL}", "disable_web_page_preview": True}, timeout=10)
+    except Exception:
+        pass
+
+
 def alert_new_jobs(jobs):
+    ids = [int(j["id"]) for j in jobs if j.get("id")]
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
     with connect() as c:
-        for j in jobs:
-            send_gotify(j)
-            send_telegram(j)
-            c.execute("UPDATE jobs SET alerted=1 WHERE id=?", (j["id"],))
+        unalerted = [rowdict(r) for r in c.execute(f"SELECT * FROM jobs WHERE id IN ({placeholders}) AND alerted=0", ids).fetchall()]
+        if len(unalerted) > ALERT_BATCH_LIMIT:
+            send_gotify_summary(len(unalerted))
+            send_telegram_summary(len(unalerted))
+        else:
+            for j in unalerted:
+                send_gotify(j)
+                send_telegram(j)
+        c.execute(f"UPDATE jobs SET alerted=1 WHERE id IN ({placeholders})", ids)
 
 
 def load_resume_text() -> str:
@@ -442,6 +665,8 @@ async def cron_loop():
 @asynccontextmanager
 async def lifespan(app):
     init_db()
+    dedupe_jobs()
+    backfill_linkedin_companies()
     task = asyncio.create_task(cron_loop()) if SCHEDULER_ENABLED else None
     yield
     if task:
