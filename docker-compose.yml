@@ -1,0 +1,16 @@
+services:
+  job-watch:
+    build: .
+    container_name: job-watch
+    restart: unless-stopped
+    ports:
+      - "8085:8085"
+    env_file:
+      - .env
+    volumes:
+      - job-watch-data:/data
+      - resume-builder-data:/resume-builder-data:ro
+volumes:
+  job-watch-data:
+  resume-builder-data:
+    external: true
