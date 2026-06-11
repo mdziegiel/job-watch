@@ -25,7 +25,7 @@ Self-hosted job monitoring and alerting for Michael Dziegiel's senior infrastruc
 - Dark glassmorphism theme matching the Resume Builder family
 - Automatic scrape loop every 6 hours plus manual scrape button
 - Status pipeline: New, Saved, Applied, Interview, Rejected, Offer
-- Gotify and Telegram alerts for newly discovered jobs
+- Telegram alerts for newly discovered jobs
 - Claude match scoring with heuristic fallback
 - One-line fit summary and match breakdown
 - Gold ideal-match badge for hybrid, within 40 miles, `$115k+`
@@ -48,7 +48,7 @@ Place screenshots here after first production deployment:
 
 ```bash
 cp .env.example .env
-# edit .env with Anthropic, Gotify, and Telegram credentials
+# edit .env with Anthropic and Telegram credentials
 docker compose up -d --build
 ```
 
@@ -71,8 +71,6 @@ DATABASE_PATH=/data/job-watch.sqlite
 RESUME_BUILDER_DB=/resume-builder-data/resume-builder.sqlite
 ANTHROPIC_API_KEY=
 ANTHROPIC_MODEL=claude-sonnet-4-20250514
-GOTIFY_URL=http://10.10.10.237:10143
-GOTIFY_TOKEN=
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_HOME_CHANNEL=
 INDEED_MCP_URL=https://mcp.indeed.com/claude/mcp

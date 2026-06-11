@@ -138,12 +138,11 @@ class JobWatchLogicTests(unittest.TestCase):
         with main.connect() as c:
             c.execute("UPDATE jobs SET alerted=1 WHERE id=?", (existing["id"],))
 
-        with patch.object(main, "send_gotify") as gotify, patch.object(main, "send_telegram") as telegram:
+        with patch.object(main, "send_telegram") as telegram:
             main.alert_new_jobs([existing, new_one])
 
-        gotify.assert_called_once()
         telegram.assert_called_once()
-        self.assertEqual(gotify.call_args.args[0]["id"], new_one["id"])
+        self.assertEqual(telegram.call_args.args[0]["id"], new_one["id"])
         with main.connect() as c:
             self.assertEqual(c.execute("SELECT alerted FROM jobs WHERE id=?", (new_one["id"],)).fetchone()[0], 1)
 
@@ -154,15 +153,11 @@ class JobWatchLogicTests(unittest.TestCase):
             self.assertTrue(is_new)
             jobs.append(saved)
 
-        with patch.object(main, "send_gotify") as gotify, \
-             patch.object(main, "send_telegram") as telegram, \
-             patch.object(main, "send_gotify_summary") as gotify_summary, \
+        with patch.object(main, "send_telegram") as telegram, \
              patch.object(main, "send_telegram_summary") as telegram_summary:
             main.alert_new_jobs(jobs)
 
-        gotify.assert_not_called()
         telegram.assert_not_called()
-        gotify_summary.assert_called_once_with(main.ALERT_BATCH_LIMIT + 1)
         telegram_summary.assert_called_once_with(main.ALERT_BATCH_LIMIT + 1)
         with main.connect() as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM jobs WHERE alerted=0").fetchone()[0], 0)

@@ -26,8 +26,6 @@ DB_PATH = os.getenv("DATABASE_PATH", "/data/job-watch.sqlite")
 RESUME_BUILDER_DB = os.getenv("RESUME_BUILDER_DB", "/resume-builder-data/resume-builder.sqlite")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_TOKEN") or ""
-GOTIFY_URL = os.getenv("GOTIFY_URL", "http://10.10.10.237:10143").rstrip("/")
-GOTIFY_TOKEN = os.getenv("GOTIFY_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_HOME_CHANNEL") or os.getenv("TELEGRAM_CHAT_ID", "")
 INDEED_MCP_URL = os.getenv("INDEED_MCP_URL", "https://mcp.indeed.com/claude/mcp")
@@ -563,32 +561,12 @@ def scrape_all():
     return {"found": len(found), "new": len(new_jobs)}
 
 
-def send_gotify(job: dict):
-    if not GOTIFY_TOKEN:
-        return
-    try:
-        msg = f"{job['title']}\n{job.get('company','')} · {job.get('location','')} · {job.get('salary','')}\nScore: {job.get('match_score')} · {job.get('fit_summary')}\n{job.get('url','')}"
-        requests.post(f"{GOTIFY_URL}/message", params={"token": GOTIFY_TOKEN}, json={"title": f"New job: {job['title']}", "message": msg, "priority": 6 if job.get("ideal_match") else 4}, timeout=10)
-    except Exception:
-        pass
-
-
 def send_telegram(job: dict):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
         text = f"New job: {job['title']}\n{job.get('company','')} · {job.get('location','')} · {job.get('salary','')}\nScore: {job.get('match_score')} · {job.get('fit_summary')}\n{job.get('url','')}"
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": False}, timeout=10)
-    except Exception:
-        pass
-
-
-def send_gotify_summary(count: int):
-    if not GOTIFY_TOKEN:
-        return
-    try:
-        message = f"{count} new jobs found — check the dashboard"
-        requests.post(f"{GOTIFY_URL}/message", params={"token": GOTIFY_TOKEN}, json={"title": "Job Watch", "message": f"{message}\n{DASHBOARD_URL}", "priority": 5}, timeout=10)
     except Exception:
         pass
 
@@ -611,11 +589,9 @@ def alert_new_jobs(jobs):
     with connect() as c:
         unalerted = [rowdict(r) for r in c.execute(f"SELECT * FROM jobs WHERE id IN ({placeholders}) AND alerted=0", ids).fetchall()]
         if len(unalerted) > ALERT_BATCH_LIMIT:
-            send_gotify_summary(len(unalerted))
             send_telegram_summary(len(unalerted))
         else:
             for j in unalerted:
-                send_gotify(j)
                 send_telegram(j)
         c.execute(f"UPDATE jobs SET alerted=1 WHERE id IN ({placeholders})", ids)
 
