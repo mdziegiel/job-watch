@@ -886,7 +886,8 @@ def rescore_existing_jobs(limit: int = 1000) -> int:
         rows = c.execute("SELECT * FROM jobs ORDER BY COALESCE(last_seen, first_seen, '') DESC LIMIT ?", (limit,)).fetchall()
         for row in rows:
             job = rowdict(row)
-            score, summary, breakdown, ideal = score_job(job)
+            # Existing-row backfills must be fast and deterministic. Do not call Claude for hundreds of rows at startup.
+            score, summary, breakdown, ideal = heuristic_score(job)
             if score != row["match_score"] or row["match_score"] == 73:
                 c.execute("UPDATE jobs SET match_score=?, fit_summary=?, score_breakdown=?, ideal_match=? WHERE id=?", (score, summary, json.dumps(breakdown), int(ideal), row["id"]))
                 updated += 1
