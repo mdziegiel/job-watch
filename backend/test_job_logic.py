@@ -232,6 +232,25 @@ class JobWatchLogicTests(unittest.TestCase):
         self.assertEqual(main.dedupe_jobs(), 1)
         with main.connect() as c:
             self.assertEqual(c.execute("SELECT fingerprint FROM jobs WHERE title='Same'").fetchone()[0], "new")
+    def test_scoring_varies_by_title_location_salary_and_skills(self):
+        strong = main.score_job(self.job(title="Senior Network Administrator", location="Lowell, MA", salary="$120,000", description="Azure Intune Hyper-V firewall network Active Directory", remote_type="hybrid"))[0]
+        weak = main.score_job(self.job(title="Help Desk Technician", location="Worcester, MA", salary="$55,000", description="password resets and tickets", remote_type="onsite", url="https://jobs.example/weak"))[0]
+        remote = main.score_job(self.job(title="Endpoint Engineer", location="Remote", salary="$110,000", description="Intune Autopilot Microsoft 365 endpoint security", remote_type="remote", url="https://jobs.example/remote"))[0]
+        self.assertNotEqual(strong, weak)
+        self.assertNotEqual(remote, weak)
+        self.assertGreater(strong, weak)
+        self.assertGreater(remote, weak)
+
+    def test_jobs_endpoint_defaults_to_last_7_days_newest_first_and_date_labels(self):
+        with main.connect() as c:
+            c.execute("INSERT INTO jobs(source,title,company,location,fingerprint,first_seen,last_seen,match_score) VALUES(?,?,?,?,?,?,?,?)", ("Seed", "Old", "Co", "Lowell", "old-filter", "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", 10))
+        fresh, _ = main.upsert_job(self.job(url="https://jobs.example/fresh"))
+        rows = main.jobs()
+        self.assertTrue(any(r["id"] == fresh["id"] for r in rows))
+        self.assertFalse(any(r.get("fingerprint") == "old-filter" for r in rows))
+        self.assertIn("Posted", rows[0]["posted_label"])
+        all_rows = main.jobs(date_range="all", sort="oldest")
+        self.assertEqual(all_rows[0]["fingerprint"], "old-filter")
 
 
 if __name__ == "__main__":

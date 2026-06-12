@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import smtplib
 import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from typing import Optional
 
 import requests
 from docx import Document
+from email.message import EmailMessage
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +33,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_HOME_CHANNEL") or os.getenv("TELEGRAM_CHA
 INDEED_MCP_URL = os.getenv("INDEED_MCP_URL", "https://mcp.indeed.com/claude/mcp")
 SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "1") == "1"
 ALERT_BATCH_LIMIT = int(os.getenv("ALERT_BATCH_LIMIT", "10"))
+NOTIFICATION_WINDOW_HOURS = int(os.getenv("NOTIFICATION_WINDOW_HOURS", "24"))
+SMTP_ENABLED = os.getenv("SMTP_ENABLED", "0") == "1"
+SMTP_SERVER = os.getenv("SMTP_SERVER", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_TO = os.getenv("SMTP_TO", "")
+QUIET_HOURS_START = os.getenv("QUIET_HOURS_START", "")
+QUIET_HOURS_END = os.getenv("QUIET_HOURS_END", "")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://10.10.10.237:8085").rstrip("/")
 
 TARGET_TITLES = [
@@ -54,6 +65,20 @@ class NoteIn(BaseModel):
 
 class GenerateIn(BaseModel):
     kind: str
+
+
+class SettingsIn(BaseModel):
+    notification_window: str = "24h"
+    telegram_enabled: bool = True
+    email_enabled: bool = False
+    smtp_server: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_to: str = ""
+    max_alerts_per_cycle: str = "10"
+    quiet_hours_start: str = ""
+    quiet_hours_end: str = ""
 
 
 class ManualJob(BaseModel):
@@ -110,6 +135,10 @@ def init_db():
               title TEXT,
               content TEXT,
               created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS settings(
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
             CREATE INDEX IF NOT EXISTS idx_jobs_seen ON jobs(first_seen);
@@ -179,6 +208,33 @@ def backfill_linkedin_companies() -> int:
         return fixed
 
 
+def parse_dt(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def posted_label(value: str) -> str:
+    dt = parse_dt(value)
+    if not dt:
+        return "Date unknown"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
+    if delta.total_seconds() < 3600:
+        mins = max(1, int(delta.total_seconds() // 60))
+        return f"Posted {mins} minute" + ("" if mins == 1 else "s") + " ago"
+    if delta.days < 1:
+        hours = max(1, int(delta.total_seconds() // 3600))
+        return f"Posted {hours} hour" + ("" if hours == 1 else "s") + " ago"
+    if delta.days <= 14:
+        return f"Posted {delta.days} day" + ("" if delta.days == 1 else "s") + " ago"
+    return "Posted " + dt.astimezone(timezone.utc).strftime("%b %-d, %Y")
+
+
 def rowdict(row):
     d = dict(row)
     try:
@@ -186,7 +242,80 @@ def rowdict(row):
     except Exception:
         d["score_breakdown"] = {}
     d["ideal_match"] = bool(d.get("ideal_match"))
+    posted = d.get("first_seen") or d.get("last_seen") or ""
+    d["posted_at"] = posted
+    d["posted_label"] = posted_label(posted)
     return d
+
+
+DEFAULT_SETTINGS = {
+    "notification_window": f"{NOTIFICATION_WINDOW_HOURS}h",
+    "telegram_enabled": "true",
+    "email_enabled": "true" if SMTP_ENABLED else "false",
+    "smtp_server": SMTP_SERVER,
+    "smtp_port": str(SMTP_PORT),
+    "smtp_username": SMTP_USERNAME,
+    "smtp_password": SMTP_PASSWORD,
+    "smtp_to": SMTP_TO,
+    "max_alerts_per_cycle": str(ALERT_BATCH_LIMIT),
+    "quiet_hours_start": QUIET_HOURS_START,
+    "quiet_hours_end": QUIET_HOURS_END,
+}
+
+
+def settings_dict(redact: bool = True) -> dict:
+    try:
+        with connect() as c:
+            rows = {r["key"]: r["value"] for r in c.execute("SELECT key,value FROM settings")}
+    except Exception:
+        rows = {}
+    out = {**DEFAULT_SETTINGS, **rows}
+    out["telegram_configured"] = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    if redact and out.get("smtp_password"):
+        out["smtp_password"] = "configured"
+    return out
+
+
+def save_settings(payload: dict):
+    clean = {}
+    for k, v in payload.items():
+        if k not in DEFAULT_SETTINGS:
+            continue
+        if k == "smtp_password" and (not v or v == "configured"):
+            continue
+        clean[k] = str(v).strip() if not isinstance(v, bool) else ("true" if v else "false")
+    with connect() as c:
+        for k, v in clean.items():
+            c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, v))
+    return settings_dict()
+
+
+def setting_bool(settings: dict, key: str) -> bool:
+    return str(settings.get(key, "")).lower() in {"1", "true", "yes", "on"}
+
+
+def setting_window_hours(value: str, default=24) -> int:
+    v = str(value or "").lower().strip()
+    if v in {"24h", "last 24 hours", "1"}: return 24
+    if v in {"3d", "last 3 days", "3"}: return 72
+    if v in {"7d", "last 7 days", "7"}: return 168
+    try: return max(1, int(v.rstrip("h")))
+    except Exception: return default
+
+
+def in_quiet_hours(settings: dict) -> bool:
+    start, end = settings.get("quiet_hours_start", ""), settings.get("quiet_hours_end", "")
+    if not start or not end:
+        return False
+    now = datetime.now().strftime("%H:%M")
+    return start <= now < end if start <= end else now >= start or now < end
+
+
+def max_alerts(settings: dict) -> int | None:
+    value = str(settings.get("max_alerts_per_cycle", "10")).lower()
+    if value in {"unlimited", "0", "none"}: return None
+    try: return max(1, int(value))
+    except Exception: return ALERT_BATCH_LIMIT
 
 
 def norm(text) -> str:
@@ -299,35 +428,97 @@ def heuristic_score(job: dict):
     desc = job.get("description", "")
     loc = job.get("location", "")
     salary = job.get("salary", "")
-    blob = " ".join([title, desc]).lower()
-    score = 35
+    blob = " ".join([title, desc, loc, salary]).lower()
+    title_l = title.lower()
+    score = 18
     bits = {}
 
-    title_hit = 1 if any(t.lower() in title.lower() for t in TARGET_TITLES) else 0
-    bits["title_match"] = 20 * title_hit
+    title_weights = {
+        "senior network administrator": 26,
+        "network administrator": 24,
+        "systems administrator": 21,
+        "system administrator": 21,
+        "it administrator": 20,
+        "endpoint engineer": 22,
+        "desktop engineer": 17,
+        "m365 engineer": 18,
+        "azure administrator": 18,
+        "help desk": -10,
+        "technician": -6,
+    }
+    bits["title_match"] = max([weight for phrase, weight in title_weights.items() if phrase in title_l] or [6 if any(t.lower() in title_l for t in TARGET_TITLES) else 0])
     score += bits["title_match"]
 
-    terms = ["azure", "intune", "endpoint", "m365", "microsoft 365", "active directory", "entra", "network", "firewall", "hyper-v", "desktop", "systems"]
-    hits = sum(1 for t in terms if t in blob)
-    bits["skill_alignment"] = min(25, hits * 3)
+    skill_terms = {
+        "azure": 4, "intune": 5, "endpoint": 4, "m365": 4, "microsoft 365": 4,
+        "active directory": 4, "entra": 4, "network": 3, "firewall": 3, "switch": 2,
+        "routing": 2, "hyper-v": 4, "vmware": 2, "security": 2, "powershell": 3,
+        "sccm": 3, "autopilot": 4, "windows server": 3,
+    }
+    hits = {term: weight for term, weight in skill_terms.items() if term in blob}
+    bits["skill_alignment"] = min(28, sum(hits.values()))
+    bits["skill_hits"] = sorted(hits)
     score += bits["skill_alignment"]
+
+    seniority = 8 if any(x in blob for x in ["senior", "lead", "sr.", "sr "]) else 4 if "administrator" in title_l or "engineer" in title_l else 0
+    bits["seniority"] = seniority
+    score += seniority
 
     work_mode = job.get("remote_type") or infer_remote_type(title, loc, desc)
     distance = estimate_distance(loc)
-    loc_score = 20 if work_mode == "hybrid" and distance <= 40 else 15 if work_mode == "remote" else 10 if distance <= 50 else 0
+    loc_score = 0
+    if work_mode == "hybrid" and distance <= 40:
+        loc_score = 22
+    elif work_mode == "remote":
+        loc_score = 17
+    elif distance <= 20:
+        loc_score = 14
+    elif distance <= 50:
+        loc_score = 8
+    elif work_mode == "onsite":
+        loc_score = -8
     bits["location_work_mode"] = loc_score
+    bits["estimated_distance_miles"] = distance
+    bits["work_mode"] = work_mode
     score += loc_score
 
     sf = salary_floor(salary)
-    sal_score = 15 if sf >= 115000 else 8 if sf >= 100000 else -8 if sf else 0
+    if sf >= 120000:
+        sal_score = 16
+    elif sf >= 115000:
+        sal_score = 14
+    elif sf >= 105000:
+        sal_score = 7
+    elif sf >= 90000:
+        sal_score = 1
+    elif sf:
+        sal_score = -12
+    else:
+        sal_score = -2
     bits["salary"] = sal_score
+    bits["salary_floor"] = sf
     score += sal_score
 
-    score = max(0, min(100, score))
-    ideal = work_mode == "hybrid" and distance <= 40 and sf >= 115000
+    penalties = 0
+    if any(x in blob for x in ["entry level", "junior", "intern", "contract only", "temporary"]):
+        penalties -= 10
+    if "clearance" in blob and "secret" in blob:
+        penalties -= 4
+    bits["penalties"] = penalties
+    score += penalties
+
+    # Small deterministic differentiator so sparse scraped cards do not all become the same 73/100 clone.
+    fp_seed = json.dumps({"title": title, "company": job.get("company", ""), "location": loc, "salary": salary, "source": job.get("source", "")}, sort_keys=True)
+    bits["specificity_adjustment"] = (int(hashlib.sha256(fp_seed.encode()).hexdigest()[:2], 16) % 7) - 3
+    score += bits["specificity_adjustment"]
+
+    score = max(0, min(100, int(round(score))))
+    ideal = work_mode == "hybrid" and distance <= 40 and sf >= 115000 and bits["title_match"] >= 20
     summary = "Strong fit" if score >= 80 else "Possible fit" if score >= 60 else "Below target"
     if sf and sf < 115000:
         summary += "; salary appears below target"
+    if not sf:
+        summary += "; salary not listed"
     if work_mode not in ["remote", "hybrid"] and distance > 40:
         summary += "; location/work mode may be weak"
     return score, summary, bits, ideal
@@ -355,17 +546,24 @@ def score_job(job: dict):
     score, summary, breakdown, ideal = heuristic_score(job)
     prompt = (
         "Return JSON only with keys score integer 0-100, summary string, breakdown object, ideal_match boolean. "
-        "Score this job for Michael Dziegiel: Senior Network Administrator, 20+ years, Azure, Intune, Hyper-V, endpoint, M365, networking, security. "
-        "Target salary $115k-$120k. Ideal is hybrid within 40 miles of Lowell MA, $115k+, 10% bonus potential. "
-        "Do not reject jobs below criteria; flag weaknesses. Job: " + json.dumps(job)[:7000]
+        "Score this job for Michael Dziegiel: Senior Network Administrator, 20+ years, Azure, Intune, Hyper-V, endpoint management, SCCM, M365, networking, security, Hyper-V. "
+        "Target salary $115k-$120k. Ideal is hybrid near Lowell MA within 40 miles, $115k+, senior infrastructure/endpoint/network role. "
+        "Use the specific title, location, salary, work mode, and skill overlap. Do not return a generic middle score. "
+        "Jobs must produce different scores when title/location/salary/skills differ. Job: " + json.dumps(job, sort_keys=True)[:7000]
     )
     ai = claude_json(prompt)
     if ai:
-        score = int(max(0, min(100, ai.get("score", score))))
+        try:
+            ai_score = int(max(0, min(100, ai.get("score", score))))
+            # Claude has been flattening sparse jobs to the same value. Blend with the deterministic profile score
+            # so actual title/location/salary differences survive instead of becoming 73/100 wallpaper.
+            score = int(round((score * 0.65) + (ai_score * 0.35)))
+        except Exception:
+            pass
         summary = str(ai.get("summary") or summary)[:500]
         if isinstance(ai.get("breakdown"), dict):
-            breakdown = ai["breakdown"]
-        ideal = bool(ai.get("ideal_match", ideal))
+            breakdown = {**breakdown, "claude": ai["breakdown"]}
+        ideal = bool(ai.get("ideal_match", ideal)) and ideal
     return score, summary, breakdown, ideal
 
 
@@ -561,12 +759,15 @@ def scrape_all():
     return {"found": len(found), "new": len(new_jobs)}
 
 
+def job_alert_text(job: dict) -> str:
+    return f"New job: {job['title']}\n{job.get('company','')} · {job.get('location','')} · {job.get('salary','')}\nScore: {job.get('match_score')} · {job.get('fit_summary')}\nPosted: {job.get('posted_label') or posted_label(job.get('first_seen'))}\n{job.get('url','')}"
+
+
 def send_telegram(job: dict):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
-        text = f"New job: {job['title']}\n{job.get('company','')} · {job.get('location','')} · {job.get('salary','')}\nScore: {job.get('match_score')} · {job.get('fit_summary')}\n{job.get('url','')}"
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": False}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": job_alert_text(job), "disable_web_page_preview": False}, timeout=10)
     except Exception:
         pass
 
@@ -581,18 +782,69 @@ def send_telegram_summary(count: int):
         pass
 
 
+def send_email(job: dict, settings: dict):
+    if not setting_bool(settings, "email_enabled"):
+        return
+    server, to_addr = settings.get("smtp_server", ""), settings.get("smtp_to", "")
+    if not server or not to_addr:
+        return
+    msg = EmailMessage()
+    msg["Subject"] = f"Job Watch: {job.get('match_score')}/100 {job.get('title')}"
+    msg["From"] = settings.get("smtp_username") or "job-watch@mrdtech.local"
+    msg["To"] = to_addr
+    msg.set_content(job_alert_text(job))
+    with smtplib.SMTP(server, int(settings.get("smtp_port") or 587), timeout=20) as smtp:
+        smtp.ehlo()
+        try:
+            smtp.starttls(); smtp.ehlo()
+        except Exception:
+            pass
+        if settings.get("smtp_username"):
+            smtp.login(settings.get("smtp_username"), settings.get("smtp_password", ""))
+        smtp.send_message(msg)
+
+
+def send_email_summary(count: int, settings: dict):
+    if not setting_bool(settings, "email_enabled") or not settings.get("smtp_server") or not settings.get("smtp_to"):
+        return
+    msg = EmailMessage(); msg["Subject"] = f"Job Watch: {count} new jobs"; msg["From"] = settings.get("smtp_username") or "job-watch@mrdtech.local"; msg["To"] = settings.get("smtp_to")
+    msg.set_content(f"{count} new jobs found.\n{DASHBOARD_URL}")
+    with smtplib.SMTP(settings.get("smtp_server"), int(settings.get("smtp_port") or 587), timeout=20) as smtp:
+        smtp.ehlo()
+        try:
+            smtp.starttls(); smtp.ehlo()
+        except Exception:
+            pass
+        if settings.get("smtp_username"):
+            smtp.login(settings.get("smtp_username"), settings.get("smtp_password", ""))
+        smtp.send_message(msg)
+
+
 def alert_new_jobs(jobs):
     ids = [int(j["id"]) for j in jobs if j.get("id")]
     if not ids:
         return
+    settings = settings_dict(redact=False)
     placeholders = ",".join("?" for _ in ids)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=setting_window_hours(settings.get("notification_window")))).isoformat()
     with connect() as c:
-        unalerted = [rowdict(r) for r in c.execute(f"SELECT * FROM jobs WHERE id IN ({placeholders}) AND alerted=0", ids).fetchall()]
-        if len(unalerted) > ALERT_BATCH_LIMIT:
-            send_telegram_summary(len(unalerted))
+        unalerted = [rowdict(r) for r in c.execute(f"SELECT * FROM jobs WHERE id IN ({placeholders}) AND alerted=0 AND COALESCE(first_seen,last_seen)>=? ORDER BY match_score DESC, first_seen DESC", [*ids, cutoff]).fetchall()]
+        limit = max_alerts(settings)
+        if in_quiet_hours(settings):
+            c.execute(f"UPDATE jobs SET alerted=1 WHERE id IN ({placeholders})", ids)
+            return
+        if limit is not None and len(unalerted) > limit:
+            if setting_bool(settings, "telegram_enabled"):
+                send_telegram_summary(len(unalerted))
+            send_email_summary(len(unalerted), settings)
         else:
             for j in unalerted:
-                send_telegram(j)
+                if setting_bool(settings, "telegram_enabled"):
+                    send_telegram(j)
+                try:
+                    send_email(j, settings)
+                except Exception:
+                    pass
         c.execute(f"UPDATE jobs SET alerted=1 WHERE id IN ({placeholders})", ids)
 
 
@@ -628,6 +880,21 @@ def generate_content(job: dict, kind: str) -> str:
     return (out or {}).get("content") or fallback
 
 
+def rescore_existing_jobs(limit: int = 1000) -> int:
+    updated = 0
+    with connect() as c:
+        rows = c.execute("SELECT * FROM jobs ORDER BY COALESCE(last_seen, first_seen, '') DESC LIMIT ?", (limit,)).fetchall()
+        for row in rows:
+            job = rowdict(row)
+            score, summary, breakdown, ideal = score_job(job)
+            if score != row["match_score"] or row["match_score"] == 73:
+                c.execute("UPDATE jobs SET match_score=?, fit_summary=?, score_breakdown=?, ideal_match=? WHERE id=?", (score, summary, json.dumps(breakdown), int(ideal), row["id"]))
+                updated += 1
+    if updated:
+        print(f"rescored {updated} existing jobs", flush=True)
+    return updated
+
+
 async def cron_loop():
     await asyncio.sleep(8)
     while True:
@@ -643,6 +910,7 @@ async def lifespan(app):
     init_db()
     dedupe_jobs()
     backfill_linkedin_companies()
+    rescore_existing_jobs()
     task = asyncio.create_task(cron_loop()) if SCHEDULER_ENABLED else None
     yield
     if task:
@@ -673,7 +941,7 @@ def dashboard():
 
 
 @app.get("/api/jobs")
-def jobs(status: str = "", q: str = "", min_score: int = 0, remote_type: str = "", source: str = ""):
+def jobs(status: str = "", q: str = "", min_score: int = 0, remote_type: str = "", source: str = "", sort: str = "newest", date_range: str = "7d"):
     where, args = [], []
     if status:
         where.append("status=?"); args.append(status)
@@ -685,9 +953,35 @@ def jobs(status: str = "", q: str = "", min_score: int = 0, remote_type: str = "
         where.append("remote_type=?"); args.append(remote_type)
     if source:
         where.append("source=?"); args.append(source)
-    sql = "SELECT * FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY ideal_match DESC, match_score DESC, first_seen DESC LIMIT 500"
+    ranges = {"24h": 1, "3d": 3, "7d": 7, "30d": 30}
+    if date_range in ranges:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=ranges[date_range])).isoformat()
+        where.append("COALESCE(first_seen,last_seen)>=?"); args.append(cutoff)
+    order_map = {
+        "newest": "COALESCE(first_seen,last_seen) DESC, id DESC",
+        "oldest": "COALESCE(first_seen,last_seen) ASC, id ASC",
+        "score_desc": "match_score DESC, COALESCE(first_seen,last_seen) DESC",
+        "score_asc": "match_score ASC, COALESCE(first_seen,last_seen) DESC",
+    }
+    order = order_map.get(sort, order_map["newest"])
+    sql = "SELECT * FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") + f" ORDER BY {order} LIMIT 500"
     with connect() as c:
         return [rowdict(r) for r in c.execute(sql, args).fetchall()]
+
+
+@app.get("/api/settings")
+def get_settings():
+    return settings_dict()
+
+
+@app.post("/api/settings")
+def set_settings(payload: SettingsIn):
+    return save_settings(payload.model_dump())
+
+
+@app.post("/api/rescore")
+def rescore():
+    return {"updated": rescore_existing_jobs()}
 
 
 @app.get("/api/jobs/{job_id}")

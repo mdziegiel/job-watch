@@ -25,8 +25,10 @@ Self-hosted job monitoring and alerting for Michael Dziegiel's senior infrastruc
 - Dark glassmorphism theme matching the Resume Builder family
 - Automatic scrape loop every 6 hours plus manual scrape button
 - Status pipeline: New, Saved, Applied, Interview, Rejected, Offer
-- Telegram alerts for newly discovered jobs
-- Claude match scoring with heuristic fallback
+- Telegram and optional SMTP email alerts for newly discovered jobs
+- Notification settings page with alert window, channel toggles, max alerts per cycle, SMTP fields, and quiet hours
+- Claude match scoring blended with deterministic profile scoring so title, location, salary, and role fit produce distinct scores
+- Date-aware job cards, newest-first default sorting, score/date sorting controls, and date-range filtering
 - One-line fit summary and match breakdown
 - Gold ideal-match badge for hybrid, within 40 miles, `$115k+`
 - Filterable job list and Kanban pipeline
@@ -76,6 +78,15 @@ TELEGRAM_HOME_CHANNEL=
 INDEED_MCP_URL=https://mcp.indeed.com/claude/mcp
 SCHEDULER_ENABLED=1
 ALERT_BATCH_LIMIT=10
+NOTIFICATION_WINDOW_HOURS=24
+SMTP_ENABLED=0
+SMTP_SERVER=
+SMTP_PORT=587
+SMTP_USERNAME=
+SMTP_PASSWORD=
+SMTP_TO=
+QUIET_HOURS_START=
+QUIET_HOURS_END=
 DASHBOARD_URL=http://10.10.10.237:8085
 ```
 
@@ -85,6 +96,9 @@ DASHBOARD_URL=http://10.10.10.237:8085
 - `GET /api/dashboard`
 - `GET /api/jobs`
 - `GET /api/jobs/{id}`
+- `GET /api/settings`
+- `POST /api/settings`
+- `POST /api/rescore`
 - `POST /api/scrape`
 - `POST /api/jobs/{id}/status`
 - `POST /api/jobs/{id}/generate`
