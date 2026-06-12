@@ -1,12 +1,38 @@
 import React,{useEffect,useState}from'react'
 import{createRoot}from'react-dom/client'
-import{Briefcase,RefreshCw,Star,ExternalLink,FileText,Kanban,LayoutDashboard,Search,Download}from'lucide-react'
+import{Briefcase,RefreshCw,Star,ExternalLink,FileText,Kanban,LayoutDashboard,Search,Download,Info,Moon,Sun,X}from'lucide-react'
 import{BarChart,Bar,XAxis,YAxis,Tooltip,ResponsiveContainer}from'recharts'
 import'./style.css'
 const API='/api'
 const api=async(p,o={})=>{const r=await fetch(API+p,{headers:{'Content-Type':'application/json'},...o});if(!r.ok)throw new Error(await r.text());return r.json()}
 const statuses=['New','Saved','Applied','Interview','Offer','Rejected']
-function App(){const[page,setPage]=useState('dashboard'),[jobs,setJobs]=useState([]),[dash,setDash]=useState(null),[sel,setSel]=useState(null),[filters,setFilters]=useState({status:'',q:'',remote_type:'',source:'',min_score:0});const load=()=>{api('/dashboard').then(setDash);api('/jobs?'+new URLSearchParams(filters)).then(setJobs)};useEffect(load,[JSON.stringify(filters)]);const open=async j=>{setSel(await api('/jobs/'+j.id));setPage('detail')};const run=async()=>{await api('/scrape',{method:'POST'});load()};return <div><header><div><h1>Job Watch Assistant</h1><p>Self-hosted job monitoring for Michael. Job boards are hostile markup wrapped in tracking pixels.</p></div><nav>{[['dashboard','Dashboard',LayoutDashboard],['jobs','Jobs',Briefcase],['kanban','Pipeline',Kanban]].map(([id,l,I])=><button key={id} className={page===id?'active':''} onClick={()=>setPage(id)}><I/> {l}</button>)}<button onClick={run}><RefreshCw/> Scrape now</button></nav></header><main>{page==='dashboard'&&<Dashboard dash={dash} jobs={jobs} open={open}/>} {page==='jobs'&&<Jobs jobs={jobs} open={open} filters={filters} setFilters={setFilters}/>} {page==='kanban'&&<KanbanView jobs={jobs} open={open} reload={load}/>} {page==='detail'&&sel&&<Detail job={sel} setJob={setSel} reload={load}/>}</main></div>}
+function App(){const[page,setPage]=useState('dashboard'),[jobs,setJobs]=useState([]),[dash,setDash]=useState(null),[sel,setSel]=useState(null),[filters,setFilters]=useState({status:'',q:'',remote_type:'',source:'',min_score:0});const[theme,setTheme]=useSuiteTheme();const[aboutOpen,setAboutOpen]=useState(false);const load=()=>{api('/dashboard').then(setDash);api('/jobs?'+new URLSearchParams(filters)).then(setJobs)};useEffect(load,[JSON.stringify(filters)]);const open=async j=>{setSel(await api('/jobs/'+j.id));setPage('detail')};const run=async()=>{await api('/scrape',{method:'POST'});load()};return <div><header className="suite-header"><div><h1>Job Watch Assistant</h1><p>Self-hosted job monitoring for Michael. Job boards are hostile markup wrapped in tracking pixels.</p></div><div className="header-actions"><nav>{[['dashboard','Dashboard',LayoutDashboard],['jobs','Jobs',Briefcase],['kanban','Pipeline',Kanban]].map(([id,l,I])=><button key={id} className={page===id?'active':''} onClick={()=>setPage(id)}><I/> {l}</button>)}<button onClick={run}><RefreshCw/> Scrape now</button></nav><SuiteIconBar theme={theme} setTheme={setTheme} setAboutOpen={setAboutOpen} repoUrl="https://github.com/mdziegiel/job-watch" /></div>{aboutOpen&&<AboutModal onClose={()=>setAboutOpen(false)} name="Job Watch" version="1.0.0" description="Self-hosted job monitoring, scoring, pipeline tracking, scraping, and generated application-document assistant."/>}</header><main>{page==='dashboard'&&<Dashboard dash={dash} jobs={jobs} open={open}/>} {page==='jobs'&&<Jobs jobs={jobs} open={open} filters={filters} setFilters={setFilters}/>} {page==='kanban'&&<KanbanView jobs={jobs} open={open} reload={load}/>} {page==='detail'&&sel&&<Detail job={sel} setJob={setSel} reload={load}/>}</main></div>}
+function useSuiteTheme() {
+  const [theme, setThemeState] = useState(() => localStorage.getItem('suite-theme') || 'dark')
+  useEffect(() => { document.body.classList.toggle('suite-light', theme === 'light'); localStorage.setItem('suite-theme', theme) }, [theme])
+  const setTheme = () => setThemeState(t => t === 'dark' ? 'light' : 'dark')
+  return [theme, setTheme]
+}
+function GithubMark() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5.99.11-.78.42-1.3.76-1.6-2.67-.31-5.47-1.34-5.47-5.94 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.66 1.65.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.63-5.48 5.93.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z" /></svg> }
+function SuiteIconBar({ theme, setTheme, setAboutOpen, repoUrl }) {
+  return <div className="suite-iconbar" aria-label="Application links">
+    <a className="suite-icon" href={repoUrl} target="_blank" rel="noreferrer" aria-label="GitHub repository" title="GitHub"><GithubMark /></a>
+    <button className="suite-icon" type="button" onClick={() => setAboutOpen(true)} aria-label="About" title="About"><Info /></button>
+    <button className="suite-icon" type="button" onClick={setTheme} aria-label="Toggle theme" title="Toggle theme">{theme === 'dark' ? <Sun /> : <Moon />}</button>
+  </div>
+}
+function AboutModal({ name, version, description, onClose }) {
+  return <div className="suite-modal-backdrop" role="dialog" aria-modal="true" aria-label={`About ${name}`} onClick={onClose}>
+    <div className="suite-modal" onClick={e => e.stopPropagation()}>
+      <button className="suite-modal-close" type="button" onClick={onClose} aria-label="Close"><X /></button>
+      <div className="suite-modal-kicker">About</div>
+      <h2>{name}</h2>
+      <p className="suite-modal-version">Version {version}</p>
+      <p>{description}</p>
+    </div>
+  </div>
+}
+
 function Dashboard({dash,jobs,open}){let data=Object.entries(dash?.score_distribution||{}).map(([name,value])=>({name,value}));return <div className="grid"><section className="hero"><h2>Dashboard</h2><p>Criteria: Lowell MA 50-mile radius, remote nationwide, target $115k-$120k, ideal hybrid within 40 miles with $115k+ and bonus potential. Jobs below criteria are flagged, not hidden.</p><div className="metrics"><Metric l="New today" v={dash?.new_today||0}/><Metric l="Total tracked" v={dash?.total||0}/><Metric l="Applied / active" v={dash?.applied||0}/></div></section><section className="card"><h3>Match score distribution</h3><div className="chart"><ResponsiveContainer><BarChart data={data}><XAxis dataKey="name" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip/><Bar dataKey="value" fill="#f97316" radius={[8,8,0,0]}/></BarChart></ResponsiveContainer></div></section><section><h3>Top matches</h3><div className="jobs">{jobs.slice(0,8).map(j=><JobCard key={j.id} j={j} open={open}/>)}</div></section></div>}
 function Metric({l,v}){return <div className="metric"><b>{v}</b><span>{l}</span></div>}
 function Jobs({jobs,open,filters,setFilters}){return <div><div className="toolbar"><Search/><input placeholder="title, company, location" value={filters.q} onChange={e=>setFilters({...filters,q:e.target.value})}/><select value={filters.status} onChange={e=>setFilters({...filters,status:e.target.value})}><option value="">All statuses</option>{statuses.map(s=><option key={s}>{s}</option>)}</select><select value={filters.remote_type} onChange={e=>setFilters({...filters,remote_type:e.target.value})}><option value="">Any work mode</option>{['remote','hybrid','onsite','unknown'].map(s=><option key={s}>{s}</option>)}</select><select value={filters.source} onChange={e=>setFilters({...filters,source:e.target.value})}><option value="">All sources</option>{['Indeed','LinkedIn','Dice','ZipRecruiter','Manual'].map(s=><option key={s}>{s}</option>)}</select><input type="number" min="0" max="100" value={filters.min_score} onChange={e=>setFilters({...filters,min_score:e.target.value})}/></div><div className="jobs">{jobs.map(j=><JobCard key={j.id} j={j} open={open}/>)}</div></div>}
