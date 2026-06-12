@@ -250,7 +250,7 @@ class JobWatchLogicTests(unittest.TestCase):
         rows = main.jobs()
         self.assertTrue(any(r["id"] == fresh["id"] for r in rows))
         self.assertFalse(any(r.get("fingerprint") == "old-filter" for r in rows))
-        self.assertIn("Found", rows[0]["posted_label"])
+        self.assertIn("Posted", rows[0]["posted_label"])
         all_rows = main.jobs(date_range="all", sort="oldest")
         self.assertEqual(all_rows[0]["fingerprint"], "old-filter")
 
@@ -267,10 +267,10 @@ class JobWatchLogicTests(unittest.TestCase):
         self.assertTrue(is_new)
         self.assertEqual(saved["posted_label"], "Posted 2 days ago")
 
-    def test_row_without_actual_posted_date_falls_back_to_found_label(self):
+    def test_row_without_actual_posted_date_uses_posted_label(self):
         saved, _ = main.upsert_job(self.job(url="https://jobs.example/fallback"))
         self.assertEqual(saved["posted_at"], "")
-        self.assertIn("Found", saved["posted_label"])
+        self.assertIn("Posted", saved["posted_label"])
 
 
 if __name__ == "__main__":

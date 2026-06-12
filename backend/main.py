@@ -252,7 +252,7 @@ def rowdict(row):
     actual_posted = d.get("posted_at") or ""
     found = d.get("first_seen") or d.get("last_seen") or ""
     d["posted_at"] = actual_posted
-    d["posted_label"] = posted_label(actual_posted, "Posted") if actual_posted else posted_label(found, "Found")
+    d["posted_label"] = posted_label(actual_posted, "Posted") if actual_posted else posted_label(found, "Posted")
     return d
 
 
