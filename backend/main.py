@@ -125,6 +125,7 @@ def init_db():
               fingerprint TEXT UNIQUE,
               first_seen TEXT,
               last_seen TEXT,
+              posted_at TEXT,
               alerted INTEGER DEFAULT 0,
               notes TEXT DEFAULT ''
             );
@@ -147,6 +148,10 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_jobs_exact_duplicate ON jobs(title, company, location);
             """
         )
+        cols = {r['name'] for r in c.execute('PRAGMA table_info(jobs)').fetchall()}
+        if 'posted_at' not in cols:
+            c.execute('ALTER TABLE jobs ADD COLUMN posted_at TEXT')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_jobs_posted ON jobs(posted_at)')
         # Existing rows predate the strict first-insert notification contract.
         # Mark them notified at startup so deploy/restart cannot resurrect old jobs as alerts.
         c.execute("UPDATE jobs SET alerted=1 WHERE alerted=0 AND first_seen IS NOT NULL")
@@ -217,22 +222,24 @@ def parse_dt(value: str):
         return None
 
 
-def posted_label(value: str) -> str:
+def posted_label(value: str, prefix: str = "Posted") -> str:
     dt = parse_dt(value)
     if not dt:
         return "Date unknown"
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    delta = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
+    now_dt = datetime.now(timezone.utc)
+    delta = now_dt - dt.astimezone(timezone.utc)
     if delta.total_seconds() < 3600:
         mins = max(1, int(delta.total_seconds() // 60))
-        return f"Posted {mins} minute" + ("" if mins == 1 else "s") + " ago"
+        return f"{prefix} {mins} minute" + ("" if mins == 1 else "s") + " ago"
     if delta.days < 1:
         hours = max(1, int(delta.total_seconds() // 3600))
-        return f"Posted {hours} hour" + ("" if hours == 1 else "s") + " ago"
+        return f"{prefix} {hours} hour" + ("" if hours == 1 else "s") + " ago"
     if delta.days <= 14:
-        return f"Posted {delta.days} day" + ("" if delta.days == 1 else "s") + " ago"
-    return "Posted " + dt.astimezone(timezone.utc).strftime("%b %-d, %Y")
+        return f"{prefix} {delta.days} day" + ("" if delta.days == 1 else "s") + " ago"
+    fmt = "%b %-d" if dt.year == now_dt.year else "%b %-d, %Y"
+    return f"{prefix} " + dt.astimezone(timezone.utc).strftime(fmt)
 
 
 def rowdict(row):
@@ -242,9 +249,10 @@ def rowdict(row):
     except Exception:
         d["score_breakdown"] = {}
     d["ideal_match"] = bool(d.get("ideal_match"))
-    posted = d.get("first_seen") or d.get("last_seen") or ""
-    d["posted_at"] = posted
-    d["posted_label"] = posted_label(posted)
+    actual_posted = d.get("posted_at") or ""
+    found = d.get("first_seen") or d.get("last_seen") or ""
+    d["posted_at"] = actual_posted
+    d["posted_label"] = posted_label(actual_posted, "Posted") if actual_posted else posted_label(found, "Found")
     return d
 
 
@@ -577,13 +585,13 @@ def upsert_job(job: dict):
         old = find_existing_job(c, job, fp)
         if old:
             c.execute(
-                "UPDATE jobs SET last_seen=?, company=COALESCE(NULLIF(company, ''), NULLIF(?, ''), company), location=COALESCE(NULLIF(location, ''), NULLIF(?, ''), location), salary=COALESCE(NULLIF(?, ''), salary), url=COALESCE(NULLIF(?, ''), url), description=COALESCE(NULLIF(?, ''), description), match_score=?, fit_summary=?, score_breakdown=?, ideal_match=?, fingerprint=COALESCE(NULLIF(fingerprint, ''), ?) WHERE id=?",
-                (utcnow(), job.get("company", ""), job.get("location", ""), job.get("salary", ""), job.get("url", ""), job.get("description", ""), score, summary, json.dumps(breakdown), int(ideal), fp, old["id"]),
+                "UPDATE jobs SET last_seen=?, posted_at=COALESCE(NULLIF(?, ''), posted_at), company=COALESCE(NULLIF(company, ''), NULLIF(?, ''), company), location=COALESCE(NULLIF(location, ''), NULLIF(?, ''), location), salary=COALESCE(NULLIF(?, ''), salary), url=COALESCE(NULLIF(?, ''), url), description=COALESCE(NULLIF(?, ''), description), match_score=?, fit_summary=?, score_breakdown=?, ideal_match=?, fingerprint=COALESCE(NULLIF(fingerprint, ''), ?) WHERE id=?",
+                (utcnow(), job.get("posted_at", ""), job.get("company", ""), job.get("location", ""), job.get("salary", ""), job.get("url", ""), job.get("description", ""), score, summary, json.dumps(breakdown), int(ideal), fp, old["id"]),
             )
             return rowdict(c.execute("SELECT * FROM jobs WHERE id=?", (old["id"],)).fetchone()), False
         c.execute(
-            "INSERT INTO jobs(source,title,company,location,salary,url,description,remote_type,match_score,fit_summary,score_breakdown,ideal_match,fingerprint,first_seen,last_seen,alerted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-            (job.get("source"), job.get("title"), job.get("company"), job.get("location"), job.get("salary"), job.get("url"), job.get("description"), job.get("remote_type"), score, summary, json.dumps(breakdown), int(ideal), fp, utcnow(), utcnow()),
+            "INSERT INTO jobs(source,title,company,location,salary,url,description,remote_type,match_score,fit_summary,score_breakdown,ideal_match,fingerprint,first_seen,last_seen,posted_at,alerted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+            (job.get("source"), job.get("title"), job.get("company"), job.get("location"), job.get("salary"), job.get("url"), job.get("description"), job.get("remote_type"), score, summary, json.dumps(breakdown), int(ideal), fp, utcnow(), utcnow(), job.get("posted_at", "")),
         )
         rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
         return rowdict(c.execute("SELECT * FROM jobs WHERE id=?", (rid,)).fetchone()), True
@@ -655,6 +663,49 @@ def extract_linkedin_location(card_html: str) -> str:
     return clean_text(m.group("value")) if m else "Lowell MA / Remote"
 
 
+
+def relative_posted_at(text: str) -> str:
+    raw = clean_text(text).lower()
+    m = re.search(r'(\d+)\s*(minute|minutes|hour|hours|day|days|week|weeks|month|months)\s+ago', raw)
+    if not m:
+        if 'just now' in raw or 'today' in raw:
+            return utcnow()
+        return ''
+    n = int(m.group(1)); unit = m.group(2)
+    days = 0
+    if unit.startswith('minute'):
+        return (datetime.now(timezone.utc) - timedelta(minutes=n)).isoformat()
+    if unit.startswith('hour'):
+        return (datetime.now(timezone.utc) - timedelta(hours=n)).isoformat()
+    if unit.startswith('day'):
+        days = n
+    elif unit.startswith('week'):
+        days = n * 7
+    elif unit.startswith('month'):
+        days = n * 30
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def extract_linkedin_posted_at(card_html: str) -> str:
+    for tag in re.findall(r'<time[^>]*>.*?</time>', card_html or '', re.S | re.I):
+        dt = html_attr(tag, 'datetime')
+        if dt:
+            parsed = parse_dt(dt) or parse_dt(dt + 'T00:00:00+00:00')
+            if parsed:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc).isoformat()
+        rel = relative_posted_at(tag)
+        if rel:
+            return rel
+    for pattern in [r'(\d+\s+(?:minute|minutes|hour|hours|day|days|week|weeks|month|months)\s+ago)', r'(just now|today)']:
+        m = re.search(pattern, card_html or '', re.I)
+        if m:
+            rel = relative_posted_at(m.group(1))
+            if rel:
+                return rel
+    return ''
+
 def parse_linkedin_jobs(page_html: str, fallback_title: str) -> list[dict]:
     jobs = []
     seen = set()
@@ -678,6 +729,7 @@ def parse_linkedin_jobs(page_html: str, fallback_title: str) -> list[dict]:
             "url": url,
             "description": "LinkedIn public listing",
             "remote_type": "unknown",
+            "posted_at": extract_linkedin_posted_at(card),
         })
     return jobs
 
@@ -760,7 +812,7 @@ def scrape_all():
 
 
 def job_alert_text(job: dict) -> str:
-    return f"New job: {job['title']}\n{job.get('company','')} · {job.get('location','')} · {job.get('salary','')}\nScore: {job.get('match_score')} · {job.get('fit_summary')}\nPosted: {job.get('posted_label') or posted_label(job.get('first_seen'))}\n{job.get('url','')}"
+    return f"New job: {job['title']}\n{job.get('company','')} · {job.get('location','')} · {job.get('salary','')}\nScore: {job.get('match_score')} · {job.get('fit_summary')}\nDate: {job.get('posted_label') or (posted_label(job.get('posted_at'), 'Posted') if job.get('posted_at') else posted_label(job.get('first_seen'), 'Found'))}\n{job.get('url','')}"
 
 
 def send_telegram(job: dict):
@@ -828,7 +880,7 @@ def alert_new_jobs(jobs):
     placeholders = ",".join("?" for _ in ids)
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=setting_window_hours(settings.get("notification_window")))).isoformat()
     with connect() as c:
-        unalerted = [rowdict(r) for r in c.execute(f"SELECT * FROM jobs WHERE id IN ({placeholders}) AND alerted=0 AND COALESCE(first_seen,last_seen)>=? ORDER BY match_score DESC, first_seen DESC", [*ids, cutoff]).fetchall()]
+        unalerted = [rowdict(r) for r in c.execute(f"SELECT * FROM jobs WHERE id IN ({placeholders}) AND alerted=0 AND COALESCE(NULLIF(posted_at,''),first_seen,last_seen)>=? ORDER BY match_score DESC, first_seen DESC", [*ids, cutoff]).fetchall()]
         limit = max_alerts(settings)
         if in_quiet_hours(settings):
             c.execute(f"UPDATE jobs SET alerted=1 WHERE id IN ({placeholders})", ids)
@@ -957,12 +1009,12 @@ def jobs(status: str = "", q: str = "", min_score: int = 0, remote_type: str = "
     ranges = {"24h": 1, "3d": 3, "7d": 7, "30d": 30}
     if date_range in ranges:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=ranges[date_range])).isoformat()
-        where.append("COALESCE(first_seen,last_seen)>=?"); args.append(cutoff)
+        where.append("COALESCE(NULLIF(posted_at,''),first_seen,last_seen)>=?"); args.append(cutoff)
     order_map = {
-        "newest": "COALESCE(first_seen,last_seen) DESC, id DESC",
-        "oldest": "COALESCE(first_seen,last_seen) ASC, id ASC",
-        "score_desc": "match_score DESC, COALESCE(first_seen,last_seen) DESC",
-        "score_asc": "match_score ASC, COALESCE(first_seen,last_seen) DESC",
+        "newest": "COALESCE(NULLIF(posted_at,''),first_seen,last_seen) DESC, id DESC",
+        "oldest": "COALESCE(NULLIF(posted_at,''),first_seen,last_seen) ASC, id ASC",
+        "score_desc": "match_score DESC, COALESCE(NULLIF(posted_at,''),first_seen,last_seen) DESC",
+        "score_asc": "match_score ASC, COALESCE(NULLIF(posted_at,''),first_seen,last_seen) DESC",
     }
     order = order_map.get(sort, order_map["newest"])
     sql = "SELECT * FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") + f" ORDER BY {order} LIMIT 500"

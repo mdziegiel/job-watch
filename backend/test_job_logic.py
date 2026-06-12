@@ -182,6 +182,7 @@ class JobWatchLogicTests(unittest.TestCase):
             <h3 class="base-search-card__title">Network Administrator</h3>
             <h4 class="base-search-card__subtitle"><a href="https://www.linkedin.com/company/acme">Acme Networks</a></h4>
             <span class="job-search-card__location">Lowell, MA</span>
+            <time datetime="2026-06-10">2 days ago</time>
           </div>
         </li>
         '''
@@ -189,6 +190,7 @@ class JobWatchLogicTests(unittest.TestCase):
         self.assertEqual(jobs[0]["company"], "Acme Networks")
         self.assertEqual(jobs[0]["title"], "Network Administrator")
         self.assertEqual(jobs[0]["location"], "Lowell, MA")
+        self.assertTrue(jobs[0]["posted_at"].startswith("2026-06-10"))
 
     def test_linkedin_parser_falls_back_to_company_slug(self):
         sample = '<div class="base-card job-search-card"><a href="https://www.linkedin.com/jobs/view/endpoint-engineer-at-acme-networks-123456789">Endpoint Engineer</a></div>'
@@ -248,9 +250,27 @@ class JobWatchLogicTests(unittest.TestCase):
         rows = main.jobs()
         self.assertTrue(any(r["id"] == fresh["id"] for r in rows))
         self.assertFalse(any(r.get("fingerprint") == "old-filter" for r in rows))
-        self.assertIn("Posted", rows[0]["posted_label"])
+        self.assertIn("Found", rows[0]["posted_label"])
         all_rows = main.jobs(date_range="all", sort="oldest")
         self.assertEqual(all_rows[0]["fingerprint"], "old-filter")
+
+    def test_linkedin_relative_date_becomes_posted_label(self):
+        sample = """
+        <div class="base-card job-search-card">
+          <a href="https://www.linkedin.com/jobs/view/systems-administrator-at-acme-123">Systems Administrator</a>
+          <time class="job-search-card__listdate">2 days ago</time>
+        </div>
+        """
+        job = main.parse_linkedin_jobs(sample, "Systems Administrator")[0]
+        self.assertTrue(job["posted_at"])
+        saved, is_new = main.upsert_job(job)
+        self.assertTrue(is_new)
+        self.assertEqual(saved["posted_label"], "Posted 2 days ago")
+
+    def test_row_without_actual_posted_date_falls_back_to_found_label(self):
+        saved, _ = main.upsert_job(self.job(url="https://jobs.example/fallback"))
+        self.assertEqual(saved["posted_at"], "")
+        self.assertIn("Found", saved["posted_label"])
 
 
 if __name__ == "__main__":
