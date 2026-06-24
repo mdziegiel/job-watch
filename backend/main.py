@@ -49,6 +49,13 @@ JSEARCH_MONTHLY_LIMIT = int(os.getenv("JSEARCH_MONTHLY_LIMIT", "200"))
 JSEARCH_PER_SCRAPE_LIMIT = int(os.getenv("JSEARCH_PER_SCRAPE_LIMIT", "1"))
 JSEARCH_RAPIDAPI_HOST = os.getenv("JSEARCH_RAPIDAPI_HOST", "jsearch.p.rapidapi.com")
 JSEARCH_SEARCH_URL = f"https://{JSEARCH_RAPIDAPI_HOST}/search-v2"
+JSEARCH_ALLOWED_PUBLISHERS = [
+    p.strip() for p in os.getenv(
+        "JSEARCH_ALLOWED_PUBLISHERS",
+        "Indeed,Glassdoor,ZipRecruiter,CareerBuilder,Monster",
+    ).split(",") if p.strip()
+]
+JSEARCH_FILTER_LOG_PATH = os.getenv("JSEARCH_FILTER_LOG_PATH", "/data/jsearch-publisher-filter.log")
 
 TARGET_TITLES = [
     "Network Administrator",
@@ -852,6 +859,36 @@ def normalize_jsearch_job(job: dict, fallback_title: str = "") -> dict:
     }
 
 
+def jsearch_publisher_allowed(publisher: str) -> bool:
+    allowed = {p.casefold() for p in JSEARCH_ALLOWED_PUBLISHERS}
+    return clean_text(publisher).casefold() in allowed
+
+
+def jsearch_filter_summary(stats: dict[str, dict[str, int]]) -> str:
+    parts = []
+    for publisher in sorted(stats, key=lambda p: p.casefold()):
+        kept = stats[publisher].get("kept", 0)
+        filtered = stats[publisher].get("filtered", 0)
+        if kept:
+            parts.append(f"{kept} {publisher} kept")
+        if filtered:
+            parts.append(f"{filtered} {publisher} filtered")
+    return ", ".join(parts) if parts else "no publisher stats"
+
+
+def log_jsearch_filter_breakdown(title: str, total: int, stats: dict[str, dict[str, int]]) -> None:
+    message = f"{total} found: {jsearch_filter_summary(stats)}"
+    line = f"{utcnow()} jsearch publisher filter title={title!r}: {message}"
+    print(line, flush=True)
+    try:
+        path = Path(JSEARCH_FILTER_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception as exc:
+        print(f"failed to write jsearch publisher filter log: {exc}", flush=True)
+
+
 def scrape_jsearch(title: str):
     if not jsearch_can_request():
         return []
@@ -866,15 +903,23 @@ def scrape_jsearch(title: str):
         rows = data.get("jobs", []) if isinstance(data, dict) else data
         jobs = []
         seen = set()
+        stats: dict[str, dict[str, int]] = {}
         for item in rows or []:
             if not isinstance(item, dict):
                 continue
             job = normalize_jsearch_job(item, title)
+            publisher = job.get("publisher") or "Unknown"
+            publisher_stats = stats.setdefault(publisher, {"kept": 0, "filtered": 0})
+            if not jsearch_publisher_allowed(publisher):
+                publisher_stats["filtered"] += 1
+                continue
             key = identity_key(job)
             if not job.get("title") or key in seen:
                 continue
             seen.add(key)
+            publisher_stats["kept"] += 1
             jobs.append(job)
+        log_jsearch_filter_breakdown(title, len(rows or []), stats)
         return jobs[:15]
     except Exception as exc:
         print(f"jsearch scrape failed for {title}: {exc}", flush=True)

@@ -78,15 +78,24 @@ class JobWatchLogicTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(delete=False)
         self.tmp.close()
+        self.log_tmp = tempfile.NamedTemporaryFile(delete=False)
+        self.log_tmp.close()
         main.DB_PATH = self.tmp.name
+        main.JSEARCH_FILTER_LOG_PATH = self.log_tmp.name
+        main.JSEARCH_ALLOWED_PUBLISHERS = ["Indeed", "Glassdoor", "ZipRecruiter", "CareerBuilder", "Monster"]
+        main.JSEARCH_PER_SCRAPE_LIMIT = 1
+        main.JSEARCH_MONTHLY_LIMIT = 200
+        main.JSEARCH_ENABLED = True
+        main.JSEARCH_RAPIDAPI_KEY = ""
         main.ANTHROPIC_API_KEY = ""
         main.init_db()
 
     def tearDown(self):
-        try:
-            os.unlink(self.tmp.name)
-        except FileNotFoundError:
-            pass
+        for path in (self.tmp.name, self.log_tmp.name):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     def job(self, **overrides):
         data = {
@@ -335,13 +344,72 @@ class JobWatchLogicTests(unittest.TestCase):
         class FakeResponse:
             def raise_for_status(self): pass
             def json(self):
-                return {"data": [{"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/1"}]}
+                return {"data": [{"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/1", "job_publisher": "Indeed"}]}
         with patch.object(main.requests, "get", return_value=FakeResponse()) as get:
             jobs = main.scrape_jsearch("Network Administrator")
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["source"], "jsearch")
         self.assertEqual(main.jsearch_usage()["used"], 1)
         get.assert_called_once()
+
+    def test_jsearch_filters_publishers_after_api_call_and_logs_breakdown(self):
+        main.JSEARCH_RAPIDAPI_KEY = "test-key"
+        main.JSEARCH_ENABLED = True
+        main.JSEARCH_MONTHLY_LIMIT = 200
+        main.JSEARCH_ALLOWED_PUBLISHERS = ["Indeed", "Glassdoor", "ZipRecruiter", "CareerBuilder", "Monster"]
+        rows = [
+            {"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/indeed", "job_publisher": "indeed"},
+            {"job_title": "Systems Administrator", "employer_name": "Beta", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/linkedin", "job_publisher": "LinkedIn"},
+            {"job_title": "Endpoint Engineer", "employer_name": "Gamma", "job_location": "Remote", "job_apply_link": "https://jobs.example/jobilize", "job_publisher": "Jobilize"},
+            {"job_title": "Desktop Engineer", "employer_name": "Delta", "job_location": "Boston, MA", "job_apply_link": "https://jobs.example/whatjobs", "job_publisher": "WhatJobs"},
+            {"job_title": "M365 Engineer", "employer_name": "Echo", "job_location": "Remote", "job_apply_link": "https://jobs.example/zip", "job_publisher": "ZipRecruiter"},
+        ]
+        class FakeResponse:
+            def raise_for_status(self): pass
+            def json(self): return {"data": rows}
+        with patch.object(main.requests, "get", return_value=FakeResponse()):
+            jobs = main.scrape_jsearch("Network Administrator")
+        self.assertEqual([job["publisher"] for job in jobs], ["indeed", "ZipRecruiter"])
+        self.assertEqual(main.jsearch_usage()["used"], 1)
+        with open(main.JSEARCH_FILTER_LOG_PATH, encoding="utf-8") as fh:
+            log = fh.read()
+        self.assertIn("5 found", log)
+        self.assertIn("1 indeed kept", log)
+        self.assertIn("1 LinkedIn filtered", log)
+        self.assertIn("1 Jobilize filtered", log)
+        self.assertIn("1 WhatJobs filtered", log)
+        self.assertIn("1 ZipRecruiter kept", log)
+
+    def test_scrape_all_only_inserts_allowlisted_jsearch_publishers(self):
+        main.JSEARCH_RAPIDAPI_KEY = "test-key"
+        main.JSEARCH_ENABLED = True
+        main.JSEARCH_MONTHLY_LIMIT = 200
+        main.JSEARCH_PER_SCRAPE_LIMIT = 1
+        main.JSEARCH_ALLOWED_PUBLISHERS = ["Indeed", "Glassdoor", "ZipRecruiter", "CareerBuilder", "Monster"]
+        rows = [
+            {"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/indeed", "job_publisher": "Indeed"},
+            {"job_title": "Systems Administrator", "employer_name": "Beta", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/linkedin", "job_publisher": "LinkedIn"},
+            {"job_title": "Endpoint Engineer", "employer_name": "Gamma", "job_location": "Remote", "job_apply_link": "https://jobs.example/talent", "job_publisher": "Talent.com"},
+        ]
+        class FakeResponse:
+            def raise_for_status(self): pass
+            def json(self): return {"data": rows}
+        with patch.object(main, "scrape_indeed_mcp", return_value=[]), \
+             patch.object(main, "scrape_linkedin", return_value=[]), \
+             patch.object(main, "scrape_dice", return_value=[]), \
+             patch.object(main, "scrape_ziprecruiter", return_value=[]), \
+             patch.object(main.requests, "get", return_value=FakeResponse()):
+            result = main.scrape_all()
+        self.assertEqual(result["found"], 1)
+        with main.connect() as c:
+            rows = c.execute("SELECT source, publisher FROM jobs ORDER BY id").fetchall()
+        self.assertEqual([(row["source"], row["publisher"]) for row in rows], [("jsearch", "Indeed")])
+        with open(main.JSEARCH_FILTER_LOG_PATH, encoding="utf-8") as fh:
+            log = fh.read()
+        self.assertIn("3 found", log)
+        self.assertIn("1 Indeed kept", log)
+        self.assertIn("1 LinkedIn filtered", log)
+        self.assertIn("1 Talent.com filtered", log)
 
 
 if __name__ == "__main__":
