@@ -1,0 +1,10 @@
+services:
+  job-watch:
+    volumes:
+      - job-watch-data:/data
+      - resume-builder-data:/resume-builder-data:ro
+volumes:
+  job-watch-data:
+    external: true
+  resume-builder-data:
+    external: true

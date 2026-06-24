@@ -43,6 +43,12 @@ SMTP_TO = os.getenv("SMTP_TO", "")
 QUIET_HOURS_START = os.getenv("QUIET_HOURS_START", "")
 QUIET_HOURS_END = os.getenv("QUIET_HOURS_END", "")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://10.10.10.237:8085").rstrip("/")
+JSEARCH_RAPIDAPI_KEY = os.getenv("JSEARCH_RAPIDAPI_KEY") or os.getenv("RAPIDAPI_KEY", "")
+JSEARCH_ENABLED = os.getenv("JSEARCH_ENABLED", "1") == "1"
+JSEARCH_MONTHLY_LIMIT = int(os.getenv("JSEARCH_MONTHLY_LIMIT", "200"))
+JSEARCH_PER_SCRAPE_LIMIT = int(os.getenv("JSEARCH_PER_SCRAPE_LIMIT", "1"))
+JSEARCH_RAPIDAPI_HOST = os.getenv("JSEARCH_RAPIDAPI_HOST", "jsearch.p.rapidapi.com")
+JSEARCH_SEARCH_URL = f"https://{JSEARCH_RAPIDAPI_HOST}/search-v2"
 
 TARGET_TITLES = [
     "Network Administrator",
@@ -110,6 +116,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS jobs(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               source TEXT NOT NULL,
+              publisher TEXT,
               title TEXT NOT NULL,
               company TEXT,
               location TEXT,
@@ -151,7 +158,10 @@ def init_db():
         cols = {r['name'] for r in c.execute('PRAGMA table_info(jobs)').fetchall()}
         if 'posted_at' not in cols:
             c.execute('ALTER TABLE jobs ADD COLUMN posted_at TEXT')
+        if 'publisher' not in cols:
+            c.execute('ALTER TABLE jobs ADD COLUMN publisher TEXT')
         c.execute('CREATE INDEX IF NOT EXISTS idx_jobs_posted ON jobs(posted_at)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_jobs_publisher ON jobs(publisher)')
         # Existing rows predate the strict first-insert notification contract.
         # Mark them notified at startup so deploy/restart cannot resurrect old jobs as alerts.
         c.execute("UPDATE jobs SET alerted=1 WHERE alerted=0 AND first_seen IS NOT NULL")
@@ -309,6 +319,48 @@ def setting_window_hours(value: str, default=24) -> int:
     if v in {"7d", "last 7 days", "7"}: return 168
     try: return max(1, int(v.rstrip("h")))
     except Exception: return default
+
+
+def setting_get(key: str, default: str = "") -> str:
+    try:
+        with connect() as c:
+            row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return row["value"] if row else default
+    except Exception:
+        return default
+
+
+def setting_put(key: str, value: str) -> None:
+    with connect() as c:
+        c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def jsearch_month_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def jsearch_usage() -> dict:
+    month = jsearch_month_key()
+    saved_month = setting_get("jsearch_usage_month", month)
+    if saved_month != month:
+        return {"month": month, "used": 0, "limit": JSEARCH_MONTHLY_LIMIT, "remaining": JSEARCH_MONTHLY_LIMIT}
+    try:
+        used = max(0, int(setting_get("jsearch_usage_count", "0")))
+    except Exception:
+        used = 0
+    return {"month": month, "used": used, "limit": JSEARCH_MONTHLY_LIMIT, "remaining": max(0, JSEARCH_MONTHLY_LIMIT - used)}
+
+
+def jsearch_can_request() -> bool:
+    if not (JSEARCH_ENABLED and JSEARCH_RAPIDAPI_KEY):
+        return False
+    return jsearch_usage()["remaining"] > 0
+
+
+def jsearch_record_request(count: int = 1) -> None:
+    usage = jsearch_usage()
+    setting_put("jsearch_usage_month", usage["month"])
+    setting_put("jsearch_usage_count", str(usage["used"] + max(0, count)))
 
 
 def in_quiet_hours(settings: dict) -> bool:
@@ -585,13 +637,13 @@ def upsert_job(job: dict):
         old = find_existing_job(c, job, fp)
         if old:
             c.execute(
-                "UPDATE jobs SET last_seen=?, posted_at=COALESCE(NULLIF(?, ''), posted_at), company=COALESCE(NULLIF(company, ''), NULLIF(?, ''), company), location=COALESCE(NULLIF(location, ''), NULLIF(?, ''), location), salary=COALESCE(NULLIF(?, ''), salary), url=COALESCE(NULLIF(?, ''), url), description=COALESCE(NULLIF(?, ''), description), match_score=?, fit_summary=?, score_breakdown=?, ideal_match=?, fingerprint=COALESCE(NULLIF(fingerprint, ''), ?) WHERE id=?",
-                (utcnow(), job.get("posted_at", ""), job.get("company", ""), job.get("location", ""), job.get("salary", ""), job.get("url", ""), job.get("description", ""), score, summary, json.dumps(breakdown), int(ideal), fp, old["id"]),
+                "UPDATE jobs SET last_seen=?, posted_at=COALESCE(NULLIF(?, ''), posted_at), publisher=COALESCE(NULLIF(?, ''), publisher), company=COALESCE(NULLIF(company, ''), NULLIF(?, ''), company), location=COALESCE(NULLIF(location, ''), NULLIF(?, ''), location), salary=COALESCE(NULLIF(?, ''), salary), url=COALESCE(NULLIF(?, ''), url), description=COALESCE(NULLIF(?, ''), description), match_score=?, fit_summary=?, score_breakdown=?, ideal_match=?, fingerprint=COALESCE(NULLIF(fingerprint, ''), ?) WHERE id=?",
+                (utcnow(), job.get("posted_at", ""), job.get("publisher", ""), job.get("company", ""), job.get("location", ""), job.get("salary", ""), job.get("url", ""), job.get("description", ""), score, summary, json.dumps(breakdown), int(ideal), fp, old["id"]),
             )
             return rowdict(c.execute("SELECT * FROM jobs WHERE id=?", (old["id"],)).fetchone()), False
         c.execute(
-            "INSERT INTO jobs(source,title,company,location,salary,url,description,remote_type,match_score,fit_summary,score_breakdown,ideal_match,fingerprint,first_seen,last_seen,posted_at,alerted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-            (job.get("source"), job.get("title"), job.get("company"), job.get("location"), job.get("salary"), job.get("url"), job.get("description"), job.get("remote_type"), score, summary, json.dumps(breakdown), int(ideal), fp, utcnow(), utcnow(), job.get("posted_at", "")),
+            "INSERT INTO jobs(source,publisher,title,company,location,salary,url,description,remote_type,match_score,fit_summary,score_breakdown,ideal_match,fingerprint,first_seen,last_seen,posted_at,alerted) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+            (job.get("source"), job.get("publisher", ""), job.get("title"), job.get("company"), job.get("location"), job.get("salary"), job.get("url"), job.get("description"), job.get("remote_type"), score, summary, json.dumps(breakdown), int(ideal), fp, utcnow(), utcnow(), job.get("posted_at", "")),
         )
         rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
         return rowdict(c.execute("SELECT * FROM jobs WHERE id=?", (rid,)).fetchone()), True
@@ -738,6 +790,97 @@ def fetch(url: str) -> str:
     return requests.get(url, headers={"User-Agent": "Mozilla/5.0 JobWatchAssistant/1.0", "Accept-Language": "en-US,en;q=0.9"}, timeout=20).text
 
 
+def jsearch_salary(job: dict) -> str:
+    min_salary = job.get("job_min_salary")
+    max_salary = job.get("job_max_salary")
+    currency = job.get("job_salary_currency") or "USD"
+    period = job.get("job_salary_period") or "year"
+    if not min_salary and not max_salary:
+        return job.get("job_salary") or ""
+    def fmt(value):
+        try:
+            return f"${int(float(value)):,}"
+        except Exception:
+            return str(value)
+    if min_salary and max_salary and min_salary != max_salary:
+        salary = f"{fmt(min_salary)} - {fmt(max_salary)}"
+    else:
+        salary = fmt(min_salary or max_salary)
+    if currency and currency != "USD":
+        salary += f" {currency}"
+    if period:
+        salary += f" / {period}"
+    return salary
+
+
+def jsearch_location(job: dict) -> str:
+    parts = [job.get("job_city"), job.get("job_state"), job.get("job_country")]
+    location = ", ".join(str(part).strip() for part in parts if part)
+    return location or job.get("job_location") or ("Remote" if job.get("job_is_remote") else "")
+
+
+def parse_jsearch_datetime(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+def normalize_jsearch_job(job: dict, fallback_title: str = "") -> dict:
+    title = clean_text(job.get("job_title") or fallback_title)
+    company = clean_company(job.get("employer_name") or "")
+    location = clean_text(jsearch_location(job))
+    description = clean_text(job.get("job_description") or "JSearch API listing")
+    url = job.get("job_apply_link") or job.get("job_google_link") or ""
+    remote_type = "remote" if job.get("job_is_remote") else infer_remote_type(title, location, description)
+    return {
+        "source": "jsearch",
+        "publisher": clean_text(job.get("job_publisher") or ""),
+        "title": title,
+        "company": company,
+        "location": location,
+        "salary": jsearch_salary(job),
+        "url": url,
+        "description": description,
+        "remote_type": remote_type,
+        "posted_at": parse_jsearch_datetime(job.get("job_posted_at_datetime_utc") or ""),
+    }
+
+
+def scrape_jsearch(title: str):
+    if not jsearch_can_request():
+        return []
+    headers = {"X-RapidAPI-Key": JSEARCH_RAPIDAPI_KEY, "X-RapidAPI-Host": JSEARCH_RAPIDAPI_HOST}
+    params = {"query": f"{title} in Lowell, MA", "num_pages": "1", "country": "us", "date_posted": "week"}
+    try:
+        r = requests.get(JSEARCH_SEARCH_URL, headers=headers, params=params, timeout=25)
+        jsearch_record_request(1)
+        r.raise_for_status()
+        payload = r.json()
+        data = payload.get("data") if isinstance(payload, dict) else []
+        rows = data.get("jobs", []) if isinstance(data, dict) else data
+        jobs = []
+        seen = set()
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            job = normalize_jsearch_job(item, title)
+            key = identity_key(job)
+            if not job.get("title") or key in seen:
+                continue
+            seen.add(key)
+            jobs.append(job)
+        return jobs[:15]
+    except Exception as exc:
+        print(f"jsearch scrape failed for {title}: {exc}", flush=True)
+        return []
+
+
 def scrape_linkedin(title: str):
     q = urllib.parse.quote(title)
     url = f"https://www.linkedin.com/jobs/search?keywords={q}&location=Lowell%2C%20Massachusetts%2C%20United%20States&distance=50"
@@ -751,11 +894,39 @@ def scrape_dice(title: str):
     q = urllib.parse.quote(title)
     url = f"https://www.dice.com/jobs?q={q}&location=Lowell,%20MA&radius=50&radiusUnit=mi&page=1&pageSize=20"
     jobs = []
+
+    def dice_value(blob: str, key: str) -> str:
+        m = re.search(r'\\"' + re.escape(key) + r'\\":\\"(?P<v>(?:\\\\.|[^"\\\\])*)\\"', blob, re.S)
+        if not m:
+            return ""
+        try:
+            return json.loads('"' + m.group("v").replace('"', r'\"') + '"')
+        except Exception:
+            return m.group("v").replace(r"\/", "/").replace(r"\u0026", "&")
+
     try:
         text = fetch(url)
-        pattern = r'"title"\s*:\s*"(?P<title>[^"]+)".*?"companyName"\s*:\s*"(?P<company>[^"]*)".*?"jobLocation"\s*:\s*"(?P<loc>[^"]*)".*?"detailUrl"\s*:\s*"(?P<url>[^"]+)"'
-        for m in re.finditer(pattern, text, re.S):
-            jobs.append({"source": "Dice", "title": m.group("title"), "company": m.group("company"), "location": m.group("loc"), "salary": "", "url": m.group("url").replace("\\/", "/"), "description": "Dice public listing", "remote_type": "unknown"})
+        matches = list(re.finditer(r'\\"detailsPageUrl\\":\\"(?P<url>(?:\\\\.|[^"\\\\])*)\\"', text, re.S))
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else m.end() + 5000
+            blob = text[m.start():end]
+            loc = ""
+            loc_m = re.search(r'\\"jobLocation\\":\{(?P<loc>.*?)\}', blob, re.S)
+            if loc_m:
+                loc = dice_value(loc_m.group("loc"), "displayName") or dice_value(loc_m.group("loc"), "city")
+            job = {
+                "source": "Dice",
+                "title": dice_value(blob, "title") or title,
+                "company": dice_value(blob, "companyName"),
+                "location": loc,
+                "salary": dice_value(blob, "salary"),
+                "url": dice_value(m.group(0), "detailsPageUrl"),
+                "description": "Dice public listing",
+                "remote_type": "unknown",
+                "posted_at": relative_posted_at(dice_value(blob, "postedDate")) or dice_value(blob, "postedDate"),
+            }
+            if job["url"] and job["url"] not in {j["url"] for j in jobs}:
+                jobs.append(job)
     except Exception:
         pass
     return jobs[:15]
@@ -800,6 +971,14 @@ def scrape_all():
             found.extend(fn(title))
         for fn in [scrape_linkedin, scrape_dice, scrape_ziprecruiter]:
             found.extend(fn(title + " remote"))
+    # JSearch is API-backed and quota-limited. Rotate target titles instead of spending one
+    # RapidAPI request per title every six hours. The free tier is 200 requests/month.
+    if JSEARCH_ENABLED and JSEARCH_RAPIDAPI_KEY and JSEARCH_PER_SCRAPE_LIMIT > 0:
+        usage = jsearch_usage()
+        start = usage["used"] % len(TARGET_TITLES)
+        titles = TARGET_TITLES[start:] + TARGET_TITLES[:start]
+        for title in titles[:JSEARCH_PER_SCRAPE_LIMIT]:
+            found.extend(scrape_jsearch(title))
     new_jobs = []
     for raw in found:
         if not raw.get("title"):
@@ -978,7 +1157,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 def health():
     with connect() as c:
         total = c.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    return {"status": "ok", "database": DB_PATH, "jobs": total, "scheduler": SCHEDULER_ENABLED, "sources": ["Indeed MCP", "LinkedIn", "Dice", "ZipRecruiter"]}
+    return {"status": "ok", "database": DB_PATH, "jobs": total, "scheduler": SCHEDULER_ENABLED, "sources": ["Indeed MCP", "LinkedIn", "Dice", "ZipRecruiter", "jsearch"], "jsearch": {"enabled": JSEARCH_ENABLED, "configured": bool(JSEARCH_RAPIDAPI_KEY), **jsearch_usage()}}
 
 
 @app.get("/api/dashboard")
@@ -1020,6 +1199,11 @@ def jobs(status: str = "", q: str = "", min_score: int = 0, remote_type: str = "
     sql = "SELECT * FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") + f" ORDER BY {order} LIMIT 500"
     with connect() as c:
         return [rowdict(r) for r in c.execute(sql, args).fetchall()]
+
+
+@app.get("/api/jsearch/quota")
+def jsearch_quota():
+    return {"enabled": JSEARCH_ENABLED, "configured": bool(JSEARCH_RAPIDAPI_KEY), **jsearch_usage()}
 
 
 @app.get("/api/settings")

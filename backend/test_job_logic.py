@@ -272,6 +272,77 @@ class JobWatchLogicTests(unittest.TestCase):
         self.assertEqual(saved["posted_at"], "")
         self.assertIn("Posted", saved["posted_label"])
 
+    def test_jsearch_normalization_maps_api_payload_to_existing_schema(self):
+        raw = {
+            "job_title": "Senior Network Administrator",
+            "employer_name": "Acme Networks",
+            "job_city": "Lowell",
+            "job_state": "MA",
+            "job_country": "US",
+            "job_min_salary": 115000,
+            "job_max_salary": 125000,
+            "job_salary_currency": "USD",
+            "job_salary_period": "year",
+            "job_apply_link": "https://jobs.example/acme-netadmin",
+            "job_publisher": "Indeed",
+            "job_description": "Hybrid Azure Intune network role",
+            "job_is_remote": False,
+            "job_posted_at_datetime_utc": "2026-06-23T12:34:56Z",
+        }
+        job = main.normalize_jsearch_job(raw, "Network Administrator")
+        self.assertEqual(job["source"], "jsearch")
+        self.assertEqual(job["publisher"], "Indeed")
+        self.assertEqual(job["title"], "Senior Network Administrator")
+        self.assertEqual(job["company"], "Acme Networks")
+        self.assertEqual(job["location"], "Lowell, MA, US")
+        self.assertEqual(job["salary"], "$115,000 - $125,000 / year")
+        self.assertEqual(job["url"], "https://jobs.example/acme-netadmin")
+        self.assertEqual(job["remote_type"], "hybrid")
+        self.assertTrue(job["posted_at"].startswith("2026-06-23T12:34:56"))
+
+    def test_jsearch_dedupes_against_existing_linkedin_by_title_company_location(self):
+        linkedin, first_is_new = main.upsert_job(self.job(source="LinkedIn", title="Endpoint Engineer", company="Acme", location="Lowell, MA", url="https://linkedin.example/job"))
+        jsearch, second_is_new = main.upsert_job(self.job(source="jsearch", title="Endpoint Engineer", company="Acme", location="Lowell, MA", url="https://jsearch.example/job"))
+        self.assertTrue(first_is_new)
+        self.assertFalse(second_is_new)
+        self.assertEqual(linkedin["id"], jsearch["id"])
+        self.assertEqual(self.count_jobs(), 1)
+
+    def test_existing_row_update_backfills_publisher_without_breaking_dedupe(self):
+        first, first_is_new = main.upsert_job(self.job(source="LinkedIn", title="Systems Administrator", company="Acme", location="Lowell, MA", url="https://linkedin.example/acme"))
+        second, second_is_new = main.upsert_job(self.job(source="jsearch", publisher="Indeed", title="Systems Administrator", company="Acme", location="Lowell, MA", url="https://indeed.example/acme"))
+        self.assertTrue(first_is_new)
+        self.assertFalse(second_is_new)
+        self.assertEqual(first["id"], second["id"])
+        with main.connect() as c:
+            row = c.execute("SELECT publisher FROM jobs WHERE id=?", (first["id"],)).fetchone()
+        self.assertEqual(row["publisher"], "Indeed")
+
+    def test_jsearch_quota_prevents_api_call_when_exhausted(self):
+        main.JSEARCH_RAPIDAPI_KEY = "test-key"
+        main.JSEARCH_ENABLED = True
+        main.JSEARCH_MONTHLY_LIMIT = 1
+        main.setting_put("jsearch_usage_month", main.jsearch_month_key())
+        main.setting_put("jsearch_usage_count", "1")
+        with patch.object(main.requests, "get") as get:
+            self.assertEqual(main.scrape_jsearch("Network Administrator"), [])
+        get.assert_not_called()
+
+    def test_jsearch_records_one_request_and_normalizes_response(self):
+        main.JSEARCH_RAPIDAPI_KEY = "test-key"
+        main.JSEARCH_ENABLED = True
+        main.JSEARCH_MONTHLY_LIMIT = 200
+        class FakeResponse:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"data": [{"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/1"}]}
+        with patch.object(main.requests, "get", return_value=FakeResponse()) as get:
+            jobs = main.scrape_jsearch("Network Administrator")
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["source"], "jsearch")
+        self.assertEqual(main.jsearch_usage()["used"], 1)
+        get.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
