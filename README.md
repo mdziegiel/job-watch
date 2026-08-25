@@ -7,8 +7,8 @@ Self-hosted job monitoring and alerting for Michael Dziegiel's senior infrastruc
 - Titles: Network Administrator, Systems Administrator, IT Administrator, Endpoint Engineer, Desktop Engineer, M365 Engineer
 - Location: Lowell MA, 50 mile radius
 - Fully remote positions nationwide
-- Target salary: `$115,000-$120,000/year`
-- Ideal match: hybrid within 40 miles of Lowell MA, `$115k+`, 10% bonus potential
+- Target salary: at/above target salary range
+- Ideal match: hybrid within target commute range, at/above target salary, bonus potential
 - Jobs below criteria are flagged and scored, not hidden.
 
 ## Sources
@@ -30,7 +30,7 @@ Self-hosted job monitoring and alerting for Michael Dziegiel's senior infrastruc
 - Claude match scoring blended with deterministic profile scoring so title, location, salary, and role fit produce distinct scores
 - Date-aware job cards, newest-first default sorting, score/date sorting controls, and date-range filtering
 - One-line fit summary and match breakdown
-- Gold ideal-match badge for hybrid, within 40 miles, `$115k+`
+- Gold ideal-match badge for hybrid, within 40 miles, at/above target salary
 - Filterable job list and Kanban pipeline
 - Job detail with description, salary, apply URL, score, and generated docs
 - Generate Cover Letter using the job plus Michael's Resume Builder SQLite data
