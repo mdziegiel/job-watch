@@ -49,6 +49,8 @@ JSEARCH_MONTHLY_LIMIT = int(os.getenv("JSEARCH_MONTHLY_LIMIT", "200"))
 JSEARCH_PER_SCRAPE_LIMIT = int(os.getenv("JSEARCH_PER_SCRAPE_LIMIT", "1"))
 JSEARCH_RAPIDAPI_HOST = os.getenv("JSEARCH_RAPIDAPI_HOST", "jsearch.p.rapidapi.com")
 JSEARCH_SEARCH_URL = f"https://{JSEARCH_RAPIDAPI_HOST}/search-v2"
+SEARCH_LOCATION = os.getenv("SEARCH_LOCATION", "Springfield, ST")
+SEARCH_RADIUS_MILES = int(os.getenv("SEARCH_RADIUS_MILES", "50"))
 JSEARCH_ALLOWED_PUBLISHERS = [
     p.strip() for p in os.getenv(
         "JSEARCH_ALLOWED_PUBLISHERS",
@@ -465,7 +467,7 @@ def infer_remote_type(title="", location="", description="") -> str:
 
 def estimate_distance(location: str) -> int:
     loc = (location or "").lower()
-    if "lowell" in loc:
+    if "springfield" in loc:
         return 0
     near = {
         "chelmsford": 5,
@@ -614,7 +616,7 @@ def score_job(job: dict):
     prompt = (
         "Return JSON only with keys score integer 0-100, summary string, breakdown object, ideal_match boolean. "
         "Score this job for Michael Dziegiel: Senior Network Administrator, 20+ years, Azure, Intune, Hyper-V, endpoint management, SCCM, M365, networking, security, Hyper-V. "
-        "Target salary $115k-$120k. Ideal is hybrid near Lowell MA within 40 miles, $115k+, senior infrastructure/endpoint/network role. "
+        "Target salary is configurable. Ideal is hybrid within the configured commute radius, at/above target salary, senior infrastructure/endpoint/network role. "
         "Use the specific title, location, salary, work mode, and skill overlap. Do not return a generic middle score. "
         "Jobs must produce different scores when title/location/salary/skills differ. Job: " + json.dumps(job, sort_keys=True)[:7000]
     )
@@ -719,7 +721,7 @@ def extract_linkedin_title(card_html: str, fallback: str) -> str:
 
 def extract_linkedin_location(card_html: str) -> str:
     m = re.search(r'<span[^>]*class=["\'][^"\']*job-search-card__location[^"\']*["\'][^>]*>(?P<value>.*?)</span>', card_html or "", re.S | re.I)
-    return clean_text(m.group("value")) if m else "Lowell MA / Remote"
+    return clean_text(m.group("value")) if m else f"{SEARCH_LOCATION} / Remote"
 
 
 
@@ -893,7 +895,7 @@ def scrape_jsearch(title: str):
     if not jsearch_can_request():
         return []
     headers = {"X-RapidAPI-Key": JSEARCH_RAPIDAPI_KEY, "X-RapidAPI-Host": JSEARCH_RAPIDAPI_HOST}
-    params = {"query": f"{title} in Lowell, MA", "num_pages": "1", "country": "us", "date_posted": "week"}
+    params = {"query": f"{title} in {SEARCH_LOCATION}", "num_pages": "1", "country": "us", "date_posted": "week"}
     try:
         r = requests.get(JSEARCH_SEARCH_URL, headers=headers, params=params, timeout=25)
         jsearch_record_request(1)
@@ -928,7 +930,8 @@ def scrape_jsearch(title: str):
 
 def scrape_linkedin(title: str):
     q = urllib.parse.quote(title)
-    url = f"https://www.linkedin.com/jobs/search?keywords={q}&location=Lowell%2C%20Massachusetts%2C%20United%20States&distance=50"
+    loc = urllib.parse.quote(SEARCH_LOCATION)
+    url = f"https://www.linkedin.com/jobs/search?keywords={q}&location={loc}&distance={SEARCH_RADIUS_MILES}"
     try:
         return parse_linkedin_jobs(fetch(url), title)[:15]
     except Exception:
@@ -937,7 +940,8 @@ def scrape_linkedin(title: str):
 
 def scrape_dice(title: str):
     q = urllib.parse.quote(title)
-    url = f"https://www.dice.com/jobs?q={q}&location=Lowell,%20MA&radius=50&radiusUnit=mi&page=1&pageSize=20"
+    loc = urllib.parse.quote(SEARCH_LOCATION)
+    url = f"https://www.dice.com/jobs?q={q}&location={loc}&radius={SEARCH_RADIUS_MILES}&radiusUnit=mi&page=1&pageSize=20"
     jobs = []
 
     def dice_value(blob: str, key: str) -> str:
@@ -979,12 +983,13 @@ def scrape_dice(title: str):
 
 def scrape_ziprecruiter(title: str):
     q = urllib.parse.quote(title)
-    url = f"https://www.ziprecruiter.com/jobs-search?search={q}&location=Lowell%2C+MA&radius=50"
+    loc = urllib.parse.quote_plus(SEARCH_LOCATION)
+    url = f"https://www.ziprecruiter.com/jobs-search?search={q}&location={loc}&radius={SEARCH_RADIUS_MILES}"
     jobs = []
     try:
         text = fetch(url)
         for m in re.finditer(r'<a[^>]+href="(?P<url>https://www\.ziprecruiter\.com/[^"#]+)"[^>]*>(?P<title>[^<]{5,120})</a>', text, re.S):
-            jobs.append({"source": "ZipRecruiter", "title": clean_text(m.group("title")), "company": "", "location": "Lowell MA / Remote", "salary": "", "url": m.group("url"), "description": "ZipRecruiter public listing", "remote_type": "unknown"})
+            jobs.append({"source": "ZipRecruiter", "title": clean_text(m.group("title")), "company": "", "location": f"{SEARCH_LOCATION} / Remote", "salary": "", "url": m.group("url"), "description": "ZipRecruiter public listing", "remote_type": "unknown"})
     except Exception:
         pass
     return jobs[:15]
@@ -993,7 +998,7 @@ def scrape_ziprecruiter(title: str):
 def scrape_indeed_mcp(title: str):
     jobs = []
     try:
-        payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_jobs", "arguments": {"query": title, "location": "Lowell, MA", "radius": 50, "remote": True}}}
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_jobs", "arguments": {"query": title, "location": SEARCH_LOCATION, "radius": SEARCH_RADIUS_MILES, "remote": True}}}
         r = requests.post(INDEED_MCP_URL, json=payload, headers={"Accept": "application/json"}, timeout=25)
         if r.ok:
             data = r.json()

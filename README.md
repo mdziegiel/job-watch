@@ -5,7 +5,7 @@ Self-hosted job monitoring and alerting for Michael Dziegiel's senior infrastruc
 ## Search criteria
 
 - Titles: Network Administrator, Systems Administrator, IT Administrator, Endpoint Engineer, Desktop Engineer, M365 Engineer
-- Location: Lowell MA, 50 mile radius
+- Location: configurable metro area, radius set in profile
 - Fully remote positions nationwide
 - Target salary: at/above target salary range
 - Ideal match: hybrid within target commute range, at/above target salary, bonus potential
@@ -39,12 +39,26 @@ Self-hosted job monitoring and alerting for Michael Dziegiel's senior infrastruc
 
 ## Screenshots
 
-Place screenshots here after first production deployment:
 
-- `screenshots/dashboard.png`
-- `screenshots/jobs.png`
-- `screenshots/job-detail.png`
-- `screenshots/kanban.png`
+
+![Dashboard](screenshots/dashboard.png)
+
+
+
+
+![Jobs](screenshots/jobs.png)
+
+
+
+
+![Job Detail](screenshots/job-detail.png)
+
+
+
+
+![Kanban Pipeline](screenshots/kanban.png)
+
+
 
 ## Docker quickstart
 

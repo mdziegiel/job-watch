@@ -102,7 +102,7 @@ class JobWatchLogicTests(unittest.TestCase):
             "source": "Test",
             "title": "Network Administrator",
             "company": "MRDTech",
-            "location": "Lowell, MA",
+            "location": "Springfield, ST",
             "salary": "$120,000",
             "url": "https://example.com/jobs/123?utm_source=garbage",
             "description": "Azure Intune network systems role",
@@ -134,7 +134,7 @@ class JobWatchLogicTests(unittest.TestCase):
         self.assertEqual(self.count_jobs(), 1)
 
     def test_same_title_company_different_location_is_new_when_url_differs(self):
-        _, first_is_new = main.upsert_job(self.job(url="https://jobs.example/a", location="Lowell, MA"))
+        _, first_is_new = main.upsert_job(self.job(url="https://jobs.example/a", location="Springfield, ST"))
         _, second_is_new = main.upsert_job(self.job(url="https://jobs.example/b", location="Boston, MA"))
 
         self.assertTrue(first_is_new)
@@ -175,7 +175,7 @@ class JobWatchLogicTests(unittest.TestCase):
         with main.connect() as c:
             c.execute(
                 "INSERT INTO jobs(source,title,company,location,fingerprint,first_seen,last_seen,alerted) VALUES(?,?,?,?,?,?,?,0)",
-                ("Seed", "Old Job", "Old Co", "Lowell, MA", "seed-old", main.utcnow(), main.utcnow()),
+                ("Seed", "Old Job", "Old Co", "Springfield, ST", "seed-old", main.utcnow(), main.utcnow()),
             )
         main.init_db()
         with main.connect() as c:
@@ -190,7 +190,7 @@ class JobWatchLogicTests(unittest.TestCase):
             </a>
             <h3 class="base-search-card__title">Network Administrator</h3>
             <h4 class="base-search-card__subtitle"><a href="https://www.linkedin.com/company/acme">Acme Networks</a></h4>
-            <span class="job-search-card__location">Lowell, MA</span>
+            <span class="job-search-card__location">Springfield, ST</span>
             <time datetime="2026-06-10">2 days ago</time>
           </div>
         </li>
@@ -198,7 +198,7 @@ class JobWatchLogicTests(unittest.TestCase):
         jobs = main.parse_linkedin_jobs(sample, "Fallback Title")
         self.assertEqual(jobs[0]["company"], "Acme Networks")
         self.assertEqual(jobs[0]["title"], "Network Administrator")
-        self.assertEqual(jobs[0]["location"], "Lowell, MA")
+        self.assertEqual(jobs[0]["location"], "Springfield, ST")
         self.assertTrue(jobs[0]["posted_at"].startswith("2026-06-10"))
 
     def test_linkedin_parser_falls_back_to_company_slug(self):
@@ -211,7 +211,7 @@ class JobWatchLogicTests(unittest.TestCase):
         with main.connect() as c:
             c.execute(
                 "INSERT INTO jobs(source,title,company,location,fingerprint,first_seen,last_seen,url) VALUES(?,?,?,?,?,?,?,?)",
-                ("LinkedIn", "Endpoint Engineer", "", "Lowell", "li", "2024-01-01", "2024-01-01", "https://www.linkedin.com/jobs/view/endpoint-engineer-at-acme-networks-123456789"),
+                ("LinkedIn", "Endpoint Engineer", "", "Springfield", "li", "2024-01-01", "2024-01-01", "https://www.linkedin.com/jobs/view/endpoint-engineer-at-acme-networks-123456789"),
             )
         self.assertEqual(main.backfill_linkedin_companies(), 1)
         with main.connect() as c:
@@ -234,17 +234,17 @@ class JobWatchLogicTests(unittest.TestCase):
         with main.connect() as c:
             c.execute(
                 "INSERT INTO jobs(source,title,company,location,fingerprint,first_seen,last_seen) VALUES(?,?,?,?,?,?,?)",
-                ("Seed", "Same", "Co", "Lowell", "old", "2024-01-01", "2024-01-01"),
+                ("Seed", "Same", "Co", "Springfield", "old", "2024-01-01", "2024-01-01"),
             )
             c.execute(
                 "INSERT INTO jobs(source,title,company,location,fingerprint,first_seen,last_seen) VALUES(?,?,?,?,?,?,?)",
-                ("Seed", "Same", "Co", "Lowell", "new", "2025-01-01", "2025-01-01"),
+                ("Seed", "Same", "Co", "Springfield", "new", "2025-01-01", "2025-01-01"),
             )
         self.assertEqual(main.dedupe_jobs(), 1)
         with main.connect() as c:
             self.assertEqual(c.execute("SELECT fingerprint FROM jobs WHERE title='Same'").fetchone()[0], "new")
     def test_scoring_varies_by_title_location_salary_and_skills(self):
-        strong = main.score_job(self.job(title="Senior Network Administrator", location="Lowell, MA", salary="$120,000", description="Azure Intune Hyper-V firewall network Active Directory", remote_type="hybrid"))[0]
+        strong = main.score_job(self.job(title="Senior Network Administrator", location="Springfield, ST", salary="$120,000", description="Azure Intune Hyper-V firewall network Active Directory", remote_type="hybrid"))[0]
         weak = main.score_job(self.job(title="Help Desk Technician", location="Worcester, MA", salary="$55,000", description="password resets and tickets", remote_type="onsite", url="https://jobs.example/weak"))[0]
         remote = main.score_job(self.job(title="Endpoint Engineer", location="Remote", salary="$110,000", description="Intune Autopilot Microsoft 365 endpoint security", remote_type="remote", url="https://jobs.example/remote"))[0]
         self.assertNotEqual(strong, weak)
@@ -254,7 +254,7 @@ class JobWatchLogicTests(unittest.TestCase):
 
     def test_jobs_endpoint_defaults_to_last_7_days_newest_first_and_date_labels(self):
         with main.connect() as c:
-            c.execute("INSERT INTO jobs(source,title,company,location,fingerprint,first_seen,last_seen,match_score) VALUES(?,?,?,?,?,?,?,?)", ("Seed", "Old", "Co", "Lowell", "old-filter", "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", 10))
+            c.execute("INSERT INTO jobs(source,title,company,location,fingerprint,first_seen,last_seen,match_score) VALUES(?,?,?,?,?,?,?,?)", ("Seed", "Old", "Co", "Springfield", "old-filter", "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", 10))
         fresh, _ = main.upsert_job(self.job(url="https://jobs.example/fresh"))
         rows = main.jobs()
         self.assertTrue(any(r["id"] == fresh["id"] for r in rows))
@@ -285,8 +285,8 @@ class JobWatchLogicTests(unittest.TestCase):
         raw = {
             "job_title": "Senior Network Administrator",
             "employer_name": "Acme Networks",
-            "job_city": "Lowell",
-            "job_state": "MA",
+            "job_city": "Springfield",
+            "job_state": "ST",
             "job_country": "US",
             "job_min_salary": 115000,
             "job_max_salary": 125000,
@@ -303,23 +303,23 @@ class JobWatchLogicTests(unittest.TestCase):
         self.assertEqual(job["publisher"], "Indeed")
         self.assertEqual(job["title"], "Senior Network Administrator")
         self.assertEqual(job["company"], "Acme Networks")
-        self.assertEqual(job["location"], "Lowell, MA, US")
+        self.assertEqual(job["location"], "Springfield, ST, US")
         self.assertEqual(job["salary"], "$115,000 - $125,000 / year")
         self.assertEqual(job["url"], "https://jobs.example/acme-netadmin")
         self.assertEqual(job["remote_type"], "hybrid")
         self.assertTrue(job["posted_at"].startswith("2026-06-23T12:34:56"))
 
     def test_jsearch_dedupes_against_existing_linkedin_by_title_company_location(self):
-        linkedin, first_is_new = main.upsert_job(self.job(source="LinkedIn", title="Endpoint Engineer", company="Acme", location="Lowell, MA", url="https://linkedin.example/job"))
-        jsearch, second_is_new = main.upsert_job(self.job(source="jsearch", title="Endpoint Engineer", company="Acme", location="Lowell, MA", url="https://jsearch.example/job"))
+        linkedin, first_is_new = main.upsert_job(self.job(source="LinkedIn", title="Endpoint Engineer", company="Acme", location="Springfield, ST", url="https://linkedin.example/job"))
+        jsearch, second_is_new = main.upsert_job(self.job(source="jsearch", title="Endpoint Engineer", company="Acme", location="Springfield, ST", url="https://jsearch.example/job"))
         self.assertTrue(first_is_new)
         self.assertFalse(second_is_new)
         self.assertEqual(linkedin["id"], jsearch["id"])
         self.assertEqual(self.count_jobs(), 1)
 
     def test_existing_row_update_backfills_publisher_without_breaking_dedupe(self):
-        first, first_is_new = main.upsert_job(self.job(source="LinkedIn", title="Systems Administrator", company="Acme", location="Lowell, MA", url="https://linkedin.example/acme"))
-        second, second_is_new = main.upsert_job(self.job(source="jsearch", publisher="Indeed", title="Systems Administrator", company="Acme", location="Lowell, MA", url="https://indeed.example/acme"))
+        first, first_is_new = main.upsert_job(self.job(source="LinkedIn", title="Systems Administrator", company="Acme", location="Springfield, ST", url="https://linkedin.example/acme"))
+        second, second_is_new = main.upsert_job(self.job(source="jsearch", publisher="Indeed", title="Systems Administrator", company="Acme", location="Springfield, ST", url="https://indeed.example/acme"))
         self.assertTrue(first_is_new)
         self.assertFalse(second_is_new)
         self.assertEqual(first["id"], second["id"])
@@ -344,7 +344,7 @@ class JobWatchLogicTests(unittest.TestCase):
         class FakeResponse:
             def raise_for_status(self): pass
             def json(self):
-                return {"data": [{"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/1", "job_publisher": "Indeed"}]}
+                return {"data": [{"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Springfield, ST", "job_apply_link": "https://jobs.example/1", "job_publisher": "Indeed"}]}
         with patch.object(main.requests, "get", return_value=FakeResponse()) as get:
             jobs = main.scrape_jsearch("Network Administrator")
         self.assertEqual(len(jobs), 1)
@@ -358,8 +358,8 @@ class JobWatchLogicTests(unittest.TestCase):
         main.JSEARCH_MONTHLY_LIMIT = 200
         main.JSEARCH_ALLOWED_PUBLISHERS = ["Indeed", "Glassdoor", "ZipRecruiter", "CareerBuilder", "Monster"]
         rows = [
-            {"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/indeed", "job_publisher": "indeed"},
-            {"job_title": "Systems Administrator", "employer_name": "Beta", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/linkedin", "job_publisher": "LinkedIn"},
+            {"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Springfield, ST", "job_apply_link": "https://jobs.example/indeed", "job_publisher": "indeed"},
+            {"job_title": "Systems Administrator", "employer_name": "Beta", "job_location": "Springfield, ST", "job_apply_link": "https://jobs.example/linkedin", "job_publisher": "LinkedIn"},
             {"job_title": "Endpoint Engineer", "employer_name": "Gamma", "job_location": "Remote", "job_apply_link": "https://jobs.example/jobilize", "job_publisher": "Jobilize"},
             {"job_title": "Desktop Engineer", "employer_name": "Delta", "job_location": "Boston, MA", "job_apply_link": "https://jobs.example/whatjobs", "job_publisher": "WhatJobs"},
             {"job_title": "M365 Engineer", "employer_name": "Echo", "job_location": "Remote", "job_apply_link": "https://jobs.example/zip", "job_publisher": "ZipRecruiter"},
@@ -387,8 +387,8 @@ class JobWatchLogicTests(unittest.TestCase):
         main.JSEARCH_PER_SCRAPE_LIMIT = 1
         main.JSEARCH_ALLOWED_PUBLISHERS = ["Indeed", "Glassdoor", "ZipRecruiter", "CareerBuilder", "Monster"]
         rows = [
-            {"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/indeed", "job_publisher": "Indeed"},
-            {"job_title": "Systems Administrator", "employer_name": "Beta", "job_location": "Lowell, MA", "job_apply_link": "https://jobs.example/linkedin", "job_publisher": "LinkedIn"},
+            {"job_title": "Network Administrator", "employer_name": "Acme", "job_location": "Springfield, ST", "job_apply_link": "https://jobs.example/indeed", "job_publisher": "Indeed"},
+            {"job_title": "Systems Administrator", "employer_name": "Beta", "job_location": "Springfield, ST", "job_apply_link": "https://jobs.example/linkedin", "job_publisher": "LinkedIn"},
             {"job_title": "Endpoint Engineer", "employer_name": "Gamma", "job_location": "Remote", "job_apply_link": "https://jobs.example/talent", "job_publisher": "Talent.com"},
         ]
         class FakeResponse:
